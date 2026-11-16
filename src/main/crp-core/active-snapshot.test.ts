@@ -1,0 +1,21 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { randomBytes } from "node:crypto";
+import { afterEach, expect, it } from "vitest";
+import { importSnapshot } from "../memory-bridge/snapshot";
+import { createActiveSnapshotExecutor } from "./active-snapshot";
+const roots: string[] = [];
+afterEach(() => { for (const root of roots.splice(0)) { if (!path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep)) throw Error("unsafe cleanup"); fs.rmSync(root, { recursive: true, force: true }); } });
+it("follows validated active snapshots without changing the MCP identity or falling back on malformed pointers", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "crp-active-test-")); roots.push(root);
+  const source = path.join(root, "source"), lib = path.join(source, "archive/rp/library"); fs.mkdirSync(path.join(lib, "evidence"), { recursive: true }); fs.mkdirSync(path.join(lib, "audit"));
+  fs.writeFileSync(path.join(lib, "registry.json"), JSON.stringify({ schema_version: "2.1", namespace_refs: {} })); fs.writeFileSync(path.join(lib, "evidence/registry.json"), "{}"); fs.writeFileSync(path.join(lib, "audit/knowledge-results.json"), '{"entries":{}}');
+  const snapshots = path.join(root, "data/snapshots"), first = await importSnapshot(source, snapshots, []), second = await importSnapshot(source, snapshots, []);
+  const execute = createActiveSnapshotExecutor({ directory: path.join(root, "data"), fallback: first, cursorKey: randomBytes(32), repository: "example/archive", commit: "a".repeat(40) });
+  const principal = { id: "existing-user", policyVersion: "v1", expiresAt: Date.now() + 100000, scopes: [{ domain: "rp" as const, realityId: "42", branchId: null, audience: "archive-reference" as const }] }, request = { operation: "context" as const, input: {} };
+  expect((await execute(principal, request, AbortSignal.timeout(10000)) as any).snapshotId).toBe(first.manifest.snapshotId);
+  const pointer = path.join(root, "data/active-main.json"); fs.writeFileSync(pointer, JSON.stringify({ commit: "b".repeat(40), snapshotId: second.manifest.snapshotId }));
+  const result = await execute(principal, request, AbortSignal.timeout(10000)) as any; expect(result.snapshotId).toBe(second.manifest.snapshotId); expect(result.sourceCommit).toBe("b".repeat(40)); expect(result.scopes).toEqual(principal.scopes);
+  fs.writeFileSync(pointer, JSON.stringify({ commit: "b".repeat(40), snapshotId: "../../private" })); await expect(execute(principal, request, AbortSignal.timeout(10000))).rejects.toThrow("POINTER");
+});

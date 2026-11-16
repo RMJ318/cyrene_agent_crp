@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { CrpSnapshot } from "../memory-bridge/snapshot";
 import { readBounded } from "../memory-bridge/safety";
-import { createSnapshotQueryExecutor } from "./snapshot-query-adapter";
+import { createActiveSnapshotExecutor } from "./active-snapshot";
 import { createCrpMcpGateway } from "./mcp-gateway";
 import { createCrpOAuthVerifier, createCrpJwksLoader, validateOAuthConfig } from "./oauth-verifier";
 
@@ -23,7 +23,7 @@ export async function startCrpMcpService(env: NodeJS.ProcessEnv = process.env) {
   const snapshot = new CrpSnapshot(env.CRP_SNAPSHOT_DIR); snapshot.validate();
   const cursorKey = Buffer.from(readBounded(env.CRP_CURSOR_KEY_FILE, 1024).toString().trim(), "base64");
   const server = createCrpMcpGateway({ resource: initial.resource, authorizationServers: [initial.issuer], cursorKey, authenticate, publicDiscovery: true,
-    execute: createSnapshotQueryExecutor(snapshot, cursorKey, { repository: env.CRP_SOURCE_REPOSITORY, commit: env.CRP_SOURCE_COMMIT }),
+    execute: createActiveSnapshotExecutor({ directory: env.CRP_SYNC_DATA_DIR, fallback: snapshot, cursorKey, repository: env.CRP_SOURCE_REPOSITORY, commit: env.CRP_SOURCE_COMMIT }),
     audit: event => console.log(JSON.stringify({ event: "CRP_MCP_RECEIPT", ...event, at: new Date().toISOString() })) });
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(port, host, resolve); }); return server;
 }
