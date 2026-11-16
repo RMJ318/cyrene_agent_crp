@@ -1,0 +1,10 @@
+{
+  "contract": "3.0-draft.2",
+  "status": "isolated-development",
+  "sourceRepository": "owner/archive",
+  "sourceCommit": null,
+  "sourceFiles": {},
+  "published": false,
+  "canonicalProductionCutover": false,
+  "productionMigrationRun": false
+}

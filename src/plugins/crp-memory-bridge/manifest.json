@@ -1,0 +1,11 @@
+{
+  "apiVersion": 1,
+  "id": "crp-memory-bridge",
+  "name": "CRP Memory Bridge",
+  "version": "0.1.0",
+  "description": "只读 CRP 检索与隔离的私人记忆；在记忆设置中配置，默认关闭。",
+  "author": "Cyrene contributors",
+  "entry": "index.js",
+  "defaultEnabled": false,
+  "deps": []
+}

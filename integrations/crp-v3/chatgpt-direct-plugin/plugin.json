@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "crp-memory-direct",
+  "version": "0.1.0",
+  "description": "Authenticated, read-only CRP recall using the existing server, with evidence and character boundaries.",
+  "author": { "name": "CRP Memory Bridge" },
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "CRP Memory Direct",
+        "shortDescription": "Read CRP with source evidence",
+        "longDescription": "Direct connection to the existing authenticated CRP server. Search and fetch within the host-bound character, reality and story time. Preserves source evidence and uncertainty; contains no private archive or API keys.",
+        "developerName": "CRP Memory Bridge",
+        "category": "Productivity",
+        "capabilities": [],
+        "defaultPrompt": "Use CRP Memory Direct to search my authorized memories and verify the returned source evidence."
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "cases": [
+    {
+      "id": "fictional-confession",
+      "query": "还记得河与旅人的告白吗",
+      "requiresSelectedRealities": ["42"],
+      "primaryAnchors": ["events:fictional-confession"],
+      "relatedAnchors": []
+    }
+  ]
+}

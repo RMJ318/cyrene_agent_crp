@@ -1,0 +1,3258 @@
+import { closeConversationDatabases } from "./storage/conversation-database-client";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Observable } from "rxjs";
+import { IPC } from "../shared/ipc-channels";
+
+const mocks = vi.hoisted(() => ({
+  handlers: new Map<string, (...args: any[]) => unknown>(),
+  listeners: new Map<string, (...args: any[]) => void>(),
+  getSession: vi.fn(),
+  getSessionRecord: vi.fn(),
+  getPendingDispatch: vi.fn(),
+  composeSession: vi.fn(),
+  getPendingMessages: vi.fn(),
+  listPendingWithdrawals: vi.fn(() => []),
+  markPendingAdjust: vi.fn(),
+  resetPendingAdjustByRun: vi.fn(),
+  runCyreneAgent: vi.fn(),
+  requestUserClarification: vi.fn(),
+  agentEvents: [] as unknown[],
+  failRuns: new Map<string, () => void>(),
+  finishRuns: new Map<string, (result?: unknown) => void>(),
+  // 可定制的终态行为
+  runFinishedResult: undefined as unknown,
+  emitDuplicateRunFinished: false,
+  errorAfterRunFinished: null as string | null,
+  skipDefaultRunFinished: false,
+  // 模拟正在运行的 Observable（不自动 complete）
+  neverComplete: false,
+  // 会话守卫/takeover 测试：abort 触发 RUN_FINISHED(cancelled) + complete，
+  // 模拟真实 harness 的 cancelled 结算链路（AGUI_CANCEL / takeover 都走这条链）
+  completeOnAbort: false,
+  beforeAbortSettlement: null as (() => Promise<void>) | null,
+  // 轨迹派发测试：主进程 app.getPath("userData") 的可替换根目录
+  userDataRoot: "",
+}));
+
+vi.mock("electron", () => ({
+  ipcMain: {
+    handle: vi.fn((channel: string, handler: (...args: any[]) => unknown) => {
+      mocks.handlers.set(channel, handler);
+    }),
+    on: vi.fn((channel: string, listener: (...args: any[]) => void) => {
+      mocks.listeners.set(channel, listener);
+    }),
+    removeListener: vi.fn(),
+  },
+  // 插话 IPC 的成功路径会广播会话变更（遍历全部窗口）
+  BrowserWindow: {
+    getAllWindows: () => [],
+  },
+  app: { getPath: () => mocks.userDataRoot },
+}));
+
+vi.mock("./orchestrator/cyrene-agent", () => ({
+  CyreneAgent: class {
+    threadId: string;
+    lastResult?: { reply: string; toolResults: unknown[] };
+
+    constructor(input: { threadId: string }) {
+      this.threadId = input.threadId;
+    }
+
+    runWithEvents(options: unknown) {
+      mocks.runCyreneAgent(options);
+      // 忠实模拟真实 CyreneAgent：读 options.runId 并 stamp 到 RUN_STARTED / RUN_FINISHED，
+      // 保证 bridge 的 canonical runId 全链路一致（ack.runId === RUN_STARTED.runId === RUN_FINISHED.runId）。
+      const runId = (options as { runId?: string } | null | undefined)?.runId;
+      const signal = (options as { signal?: AbortSignal } | null | undefined)?.signal;
+      return new Observable((subscriber) => {
+        mocks.failRuns.set(runId!, () => subscriber.error(new Error("MODEL_STREAM_FAILED")));
+        mocks.finishRuns.set(runId!, (result?: unknown) => { subscriber.next({ type: "RUN_FINISHED", runId, result }); subscriber.complete(); });
+        this.lastResult = { reply: "抱抱你", toolResults: [] };
+        subscriber.next({ type: "RUN_STARTED", runId });
+        for (const event of mocks.agentEvents) subscriber.next(event);
+        if (!mocks.skipDefaultRunFinished) {
+          const finishedEvent: { type: string; runId?: string; result?: unknown } = { type: "RUN_FINISHED", runId };
+          if (mocks.runFinishedResult !== undefined) {
+            finishedEvent.result = mocks.runFinishedResult;
+          }
+          subscriber.next(finishedEvent);
+          if (mocks.emitDuplicateRunFinished) {
+            subscriber.next({ type: "RUN_FINISHED", runId, result: mocks.runFinishedResult });
+          }
+          if (mocks.errorAfterRunFinished) {
+            subscriber.error(new Error(mocks.errorAfterRunFinished));
+            return;
+          }
+        }
+        // 会话守卫/takeover 测试：abort 触发 cancelled 结算链路
+        if (mocks.completeOnAbort && signal) {
+          signal.addEventListener("abort", async () => {
+            await mocks.beforeAbortSettlement?.();
+            subscriber.next({
+              type: "RUN_FINISHED",
+              runId,
+              result: { status: "cancelled", reason: "user_cancelled", externalEffectsMayContinue: true },
+            });
+            subscriber.complete();
+          });
+        }
+        // neverComplete 模拟正在运行的 Observable，不自动 complete
+        if (!mocks.neverComplete) {
+          subscriber.complete();
+        }
+      });
+    }
+  },
+}));
+
+vi.mock("./orchestrator/tools/history-tools", () => ({
+  indexConversationTurn: vi.fn(),
+}));
+
+vi.mock("./chats/chats-store", () => ({
+  getSession: mocks.getSession,
+  getSessionRecord: mocks.getSessionRecord,
+  getPendingDispatch: mocks.getPendingDispatch,
+  composeSession: mocks.composeSession,
+  getPendingMessages: mocks.getPendingMessages,
+  listPendingWithdrawals: mocks.listPendingWithdrawals,
+  markPendingAdjust: mocks.markPendingAdjust,
+  resetPendingAdjustByRun: mocks.resetPendingAdjustByRun,
+}));
+
+
+vi.mock("./user-choice", () => ({
+  requestUserClarification: mocks.requestUserClarification,
+  cancelPendingChoicesForRun: vi.fn(),
+}));
+
+vi.mock("./permission", () => ({
+  cancelPendingApprovalsForRun: vi.fn(),
+  checkPermission: vi.fn(),
+}));
+
+beforeEach(() => { mocks.userDataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-db-")); });
+afterEach(async () => { await closeConversationDatabases(); });
+
+describe("agui-bridge sticker event ordering", () => {
+  // 每个测试前重置可定制的终态行为字段，
+  // 避免上一个测试的副作用泄漏到下一个测试。
+  beforeEach(() => {
+    mocks.userDataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-db-"));
+    mocks.runFinishedResult = undefined;
+    mocks.emitDuplicateRunFinished = false;
+    mocks.errorAfterRunFinished = null;
+    mocks.skipDefaultRunFinished = false;
+    mocks.neverComplete = false;
+    mocks.completeOnAbort = false;
+    mocks.getSessionRecord.mockReset();
+    mocks.getPendingDispatch.mockReset();
+    mocks.composeSession.mockReset();
+  });
+
+  it("成功桌面对话把来源、模式和 canonical runId 交给收尾回调", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.getSession.mockReturnValue({ id: "chat-events", mode: "chat" });
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const onFinished = vi.fn(async () => ({ sticker: null }));
+    registerAgUiIpc(async () => ({
+      options: {
+        settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+        messages: [],
+        timeoutMs: 1000,
+        toolSystemContent: "TOOL",
+        soulSystemBaseContent: "SOUL",
+      },
+      latestUserText: "你好",
+    }), onFinished, () => null);
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    const ack = await handler({
+      sender: { isDestroyed: () => false, send: () => {} },
+    }, { assistantTurnId: "fixture-5948",
+      messages: [{ role: "user", content: "你好" }],
+      sessionId: "chat-events",
+    }) as { runId: string };
+    await expect.poll(() => onFinished.mock.calls.length).toBe(1);
+
+    expect(onFinished).toHaveBeenCalledWith(
+      expect.objectContaining({ reply: "抱抱你" }),
+      "你好",
+      expect.objectContaining({
+        source: "desktop",
+        mode: "chat",
+        conversationId: "chat-events",
+        runId: ack.runId,
+        assistantEntryId: expect.any(String),
+      }),
+    );
+  });
+
+  it("v2 pending claim 通过 composed loader 恢复 canonical user 后可启动 AGUI_RUN", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    const transcriptRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-v2-claim-"));
+    mocks.userDataRoot = transcriptRoot;
+    const pendingDispatch = {
+      messageId: "pending-user",
+      claimedAt: 10,
+      userMessage: {
+        id: "pending-user",
+        at: 10,
+        text: "崩溃前输入",
+        visibleContent: "崩溃前输入",
+        sticker: "calm",
+      },
+    };
+    const record = {
+      id: "v2-claim",
+      title: "待恢复",
+      identityId: null,
+      createdAt: 1,
+      updatedAt: 10,
+      schemaVersion: 2,
+      messageCount: 0,
+      mode: "chat",
+      pendingDispatch,
+    };
+    const dir = path.join(transcriptRoot, "cyrene-chats", "sessions");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "v2-claim.json"), JSON.stringify(record));
+    mocks.getSession.mockReturnValue(null);
+    mocks.getSessionRecord.mockReturnValue(record);
+    mocks.getPendingDispatch.mockReturnValue(pendingDispatch);
+    mocks.composeSession.mockImplementation((_record: unknown, messages: Array<{ id: string }>) => ({
+      ...record,
+      schemaVersion: 1,
+      messages: messages.map((message) => message.id === "user:v1:pending-user:r1"
+        ? { ...message, id: "pending-user" }
+        : message),
+    }));
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    registerAgUiIpc(async () => ({
+      options: {
+        settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+        messages: [], timeoutMs: 1000, toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL",
+      },
+      latestUserText: "崩溃前输入",
+    }), async () => ({}), () => null);
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    const ack = await handler({ sender: { isDestroyed: () => false, send: () => {} } }, { assistantTurnId: "fixture-8281",
+      sessionId: "v2-claim",
+      userTurnId: "pending-user",
+      messages: [{ role: "user", content: "崩溃前输入" }],
+    }) as { runId: string };
+    expect(ack.runId).toEqual(expect.any(String));
+    const { ConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const transcript = await new ConversationTranscriptStore(transcriptRoot).read("v2-claim");
+    expect(transcript.entries.filter((entry) => entry.kind === "user")).toHaveLength(1);
+    expect(transcript.entries[0]).toEqual(expect.objectContaining({
+      id: "user:v1:pending-user:r1",
+      turnId: "pending-user",
+    }));
+    await closeConversationDatabases();
+    fs.rmSync(transcriptRoot, { recursive: true, force: true });
+    mocks.userDataRoot = "";
+  });
+
+  it("桌面轮次事件走协调器：开始登记、终态结算、落盘确认后发布一次", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.listeners.clear();
+    // 桌面派发带 userTurnId：session 需含该 user 消息，轨迹写入用临时目录
+    const transcriptRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-pending-"));
+    mocks.userDataRoot = transcriptRoot;
+    mocks.getSession.mockReturnValue({
+      id: "chat-pending",
+      mode: "chat",
+      messages: [{ id: "msg-user-1", role: "user", content: "你好", at: 1 }],
+    });
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const { createPendingTurnLifecycle } = await import("./plugin-host/pending-turn-lifecycle");
+    const publisher = {
+      publishTurnStarted: vi.fn(),
+      publishTurnFinished: vi.fn(),
+      publishSchedulerFinished: vi.fn(),
+    };
+    // 真实协调器全链路：beginTurn（桥内）→ settleTerminal（complete 路径）→ confirmPersistence（落盘确认 IPC）
+    const pendingTurns = createPendingTurnLifecycle({ publisher: publisher as never, now: () => 0 });
+    registerAgUiIpc(async () => ({
+      options: {
+        settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+        messages: [],
+        timeoutMs: 1000,
+        toolSystemContent: "TOOL",
+        soulSystemBaseContent: "SOUL",
+      },
+      latestUserText: "你好",
+    }), async () => ({}), () => null, undefined, undefined, pendingTurns);
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    const persistListener = mocks.listeners.get(IPC.AGUI_RUN_PERSISTED);
+    if (!handler || !persistListener) throw new Error("AGUI_RUN / AGUI_RUN_PERSISTED 未注册");
+    const sender = {
+      isDestroyed: () => false,
+      send: () => {},
+      once: vi.fn(),
+      removeListener: vi.fn(),
+    };
+    const ack = await handler({ sender }, {
+      messages: [{ role: "user", content: "你好" }],
+      sessionId: "chat-pending",
+      userTurnId: "msg-user-1",
+      assistantTurnId: "msg-assistant-1",
+    }) as { runId: string };
+
+    // turn:started 立即发布；终态结算后等待落盘确认（条目仍待结算）
+    expect(publisher.publishTurnStarted).toHaveBeenCalledTimes(1);
+    expect(publisher.publishTurnStarted).toHaveBeenCalledWith({
+      source: "desktop",
+      runId: ack.runId,
+      mode: "chat",
+      conversationId: "chat-pending",
+      inputMessageId: "msg-user-1",
+    });
+    await vi.waitFor(() => expect(pendingTurns.pendingCount()).toBe(1));
+    expect(publisher.publishTurnFinished).not.toHaveBeenCalled();
+
+    // 渲染端落盘确认（单向通知）→ 终态 + 落盘确认双条件满足，发布一次
+    persistListener({}, { runId: ack.runId, finalMessageId: "msg-assistant-1" });
+    await vi.waitFor(() => expect(publisher.publishTurnFinished).toHaveBeenCalledTimes(1));
+    expect(publisher.publishTurnFinished).toHaveBeenCalledWith(expect.objectContaining({
+      source: "desktop",
+      runId: ack.runId,
+      mode: "chat",
+      conversationId: "chat-pending",
+      inputMessageId: "msg-user-1",
+      finalMessageId: "msg-assistant-1",
+      status: "success",
+    }));
+    expect(pendingTurns.pendingCount()).toBe(0);
+    await closeConversationDatabases();
+    fs.rmSync(transcriptRoot, { recursive: true, force: true });
+    mocks.userDataRoot = "";
+  });
+
+  it("routes structured Ask cards to the AG-UI run sender", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.requestUserClarification.mockReset();
+    mocks.getSession.mockReturnValue({
+      id: "work-ask",
+      mode: "work",
+      workspaceBinding: { workspaceRoot: "C:\\workspace", displayName: "workspace", boundAt: 1 },
+    });
+    mocks.requestUserClarification.mockImplementation(async (_card, send, onSettled, identity) => {
+      send({
+        interactionId: "choice-1",
+        runId: identity.runId,
+        revision: identity.revision,
+        mode: "semantic_clarification",
+        intro: "需要确认",
+        questions: [{
+          id: "question-1",
+          prompt: "选择格式？",
+          required: true,
+          multiple: false,
+          options: [{ id: "word", label: "Word" }, { id: "pdf", label: "PDF" }],
+          customInput: { enabled: true },
+        }],
+      });
+      onSettled({ id: "choice-1", runId: identity.runId, revision: identity.revision, reason: "timeout" });
+      return { requestId: "choice-1", answers: [] };
+    });
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sent: unknown[] = [];
+    const sender = { isDestroyed: () => false, send: (_channel: string, event: unknown) => sent.push(event) };
+    registerAgUiIpc(async () => ({
+      options: {
+        settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+        messages: [], timeoutMs: 1000, toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL",
+      },
+      latestUserText: "帮我生成一份文档",
+    }), async () => {}, () => null);
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    await handler({ sender }, { assistantTurnId: "fixture-14061", messages: [{ role: "user", content: "帮我生成一份文档" }], sessionId: "work-ask" });
+
+    const options = mocks.runCyreneAgent.mock.calls[0]?.[0] as {
+      requestUserClarification: (card: unknown) => Promise<unknown>;
+    };
+    await options.requestUserClarification({ intro: "需要确认", questions: [], deferredFields: [] });
+
+    expect(mocks.requestUserClarification).toHaveBeenCalledOnce();
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: "CUSTOM",
+      name: "cyrene.choice",
+      value: expect.objectContaining({ interactionId: "choice-1", runId: expect.any(String), revision: 1 }),
+    }));
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: "CUSTOM",
+      name: "cyrene.choice.dismiss",
+      value: expect.objectContaining({ id: "choice-1", runId: expect.any(String), revision: 1, reason: "timeout" }),
+    }));
+  });
+
+  it("turns leading <think> text into reasoning events before forwarding the assistant start", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.agentEvents = [
+      { type: "TEXT_MESSAGE_START", messageId: "m1", role: "assistant" },
+      { type: "TEXT_MESSAGE_CONTENT", messageId: "m1", delta: "<think>先分析" },
+      { type: "TEXT_MESSAGE_CONTENT", messageId: "m1", delta: "问题</think>正式回答" },
+      { type: "TEXT_MESSAGE_END", messageId: "m1" },
+    ];
+    mocks.getSession.mockReturnValue({ id: "chat-think", mode: "chat" });
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sent: Array<{ type?: string; delta?: string; runId?: string }> = [];
+    const sender = {
+      isDestroyed: () => false,
+      send: (_channel: string, event: { type?: string; delta?: string; runId?: string }) => sent.push(event),
+    };
+    registerAgUiIpc(
+      async () => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: [],
+          timeoutMs: 1000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: "解释一下",
+      }),
+      async () => {},
+      () => null,
+    );
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    await handler({ sender }, { assistantTurnId: "fixture-16347", messages: [{ role: "user", content: "解释一下" }], sessionId: "chat-think" });
+    await expect.poll(() => sent.some((event) => event.type === "RUN_FINISHED")).toBe(true);
+
+    expect(sent.map((event) => event.type)).toEqual([
+      "RUN_STARTED",
+      "REASONING_MESSAGE_START",
+      "REASONING_MESSAGE_CONTENT",
+      "REASONING_MESSAGE_END",
+      "TEXT_MESSAGE_START",
+      "TEXT_MESSAGE_CONTENT",
+      "TEXT_MESSAGE_END",
+      "RUN_FINISHED",
+    ]);
+    expect(sent.find((event) => event.type === "REASONING_MESSAGE_CONTENT")?.delta).toBe("先分析问题");
+    expect(sent.find((event) => event.type === "TEXT_MESSAGE_CONTENT")?.delta).toBe("正式回答");
+    const runId = sent.find((event) => event.type === "RUN_STARTED")?.runId;
+    expect(runId).toEqual(expect.any(String));
+    expect(sent.filter((event) => event.type?.startsWith("TEXT_MESSAGE")).every((event) => event.runId === runId)).toBe(true);
+    mocks.agentEvents = [];
+  });
+
+  it.each(["chat", "work", "code"] as const)("removes repeated leading time metadata for %s replies", async (mode) => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.agentEvents = [
+      { type: "TEXT_MESSAGE_START", messageId: "m-time", role: "assistant" },
+      { type: "TEXT_MESSAGE_CONTENT", messageId: "m-time", delta: "[2026-08-10 18:18, Asia/Shanghai]\n" },
+      { type: "TEXT_MESSAGE_CONTENT", messageId: "m-time", delta: "[2026-08-10 18:18, Asia/Shanghai]真正回复" },
+      { type: "TEXT_MESSAGE_END", messageId: "m-time" },
+    ];
+    mocks.getSession.mockReturnValue({
+      id: `${mode}-time`,
+      mode,
+      ...(mode === "chat" ? {} : { workspaceBinding: { workspaceRoot: "C:\\workspace", displayName: "workspace", boundAt: 1 } }),
+    });
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sent: Array<{ type?: string; delta?: string }> = [];
+    registerAgUiIpc(async () => ({
+      options: { settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 }, messages: [], timeoutMs: 1000, toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" },
+      latestUserText: "测试",
+    }), async () => {}, () => null);
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    await handler({ sender: { isDestroyed: () => false, send: (_channel: string, event: { type?: string; delta?: string }) => sent.push(event) } }, { assistantTurnId: "fixture-18643", messages: [{ role: "user", content: "测试" }], sessionId: `${mode}-time` });
+
+    expect(sent.filter((event) => event.type === "TEXT_MESSAGE_CONTENT").map((event) => event.delta).join("")).toBe("真正回复");
+    mocks.agentEvents = [];
+  });
+
+  it("delivers sticker side effects before RUN_FINISHED so renderer keeps listening", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.getSession.mockReturnValue({ id: "chat-sticker", mode: "chat" });
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sent: unknown[] = [];
+    const sender = {
+      isDestroyed: () => false,
+      send: (_channel: string, event: unknown) => {
+        sent.push(event);
+      },
+    };
+
+    registerAgUiIpc(
+      async () => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: [],
+          timeoutMs: 1000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: "累了",
+      }),
+      async () => ({ sticker: "hugtight" }),
+      () => null,
+    );
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    await handler(
+      { sender },
+      { assistantTurnId: "fixture-20046", messages: [{ role: "user", content: "累了" }], sessionId: "chat-sticker", style: "01_default.md" },
+    );
+    // complete 回调里 run 终态统计同步（真实 fs）先于终态事件发送，
+    // 等待 RUN_FINISHED 真正送达后再断言事件顺序
+    await vi.waitFor(() => {
+      expect(sent.some((event) => (event as { type?: string }).type === "RUN_FINISHED")).toBe(true);
+    });
+
+    const eventTypes = sent.map((event) => (event as { type?: string; name?: string }).name ?? (event as { type?: string }).type);
+    expect(eventTypes).toEqual(["RUN_STARTED", "cyrene.sticker", "RUN_FINISHED"]);
+  });
+
+  it("uses the Chat session mode while preserving renderer styleId", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.getSession.mockReturnValue({ id: "chat-style", mode: "chat" });
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const buildOptions = vi.fn(async () => ({
+      options: {
+        settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+        messages: [],
+        timeoutMs: 1000,
+        toolSystemContent: "TOOL",
+        soulSystemBaseContent: "SOUL",
+      },
+      latestUserText: "hi",
+    }));
+    const sender = {
+      isDestroyed: () => false,
+      send: () => {},
+    };
+
+    registerAgUiIpc(buildOptions, async () => {}, () => null);
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    await handler(
+      { sender },
+      { assistantTurnId: "fixture-21520",
+        messages: [{ role: "user", content: "hi" }],
+        sessionId: "chat-style",
+        styleId: "lively",
+        executionMode: "work",
+      },
+    );
+
+    expect(buildOptions).toHaveBeenCalledWith(expect.objectContaining({
+      styleId: "lively",
+      executionMode: "chat",
+    }));
+  });
+
+  it("keeps Work requests on CyreneAgent and never dispatches the Code runtime", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSession.mockReturnValue({
+      id: "work-chat",
+      mode: "work",
+      workspaceBinding: { workspaceRoot: "C:\\workspace", displayName: "workspace", boundAt: 1 },
+    });
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const buildOptions = vi.fn(async () => ({
+      options: {
+        settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+        messages: [],
+        timeoutMs: 1000,
+        toolSystemContent: "TOOL",
+        soulSystemBaseContent: "SOUL",
+      },
+      latestUserText: "修改项目文件",
+    }));
+    registerAgUiIpc(buildOptions, async () => {}, () => null);
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+
+    await handler({
+      sender: { isDestroyed: () => false, send: () => {} },
+    }, { assistantTurnId: "fixture-22834",
+      messages: [{ role: "user", content: "修改项目文件" }],
+      sessionId: "work-chat",
+      executionMode: "chat",
+    });
+
+    expect(buildOptions).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "work-chat",
+      executionMode: "work",
+    }));
+    expect(mocks.runCyreneAgent).toHaveBeenCalledOnce();
+    expect(mocks.runCyreneAgent).toHaveBeenCalledWith(expect.objectContaining({
+      executionMode: "work",
+    }));
+  });
+
+  it("rejects project modes without a trusted workspace binding", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSession.mockReturnValue({ id: "work-no-workspace", mode: "work" });
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    registerAgUiIpc(vi.fn(), async () => {}, () => null);
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+
+    await expect(handler({
+      sender: { isDestroyed: () => false, send: () => {} },
+    }, { assistantTurnId: "fixture-23875",
+      messages: [{ role: "user", content: "开始" }],
+      sessionId: "work-no-workspace",
+    })).rejects.toThrow("需要先绑定项目工作区");
+    expect(mocks.runCyreneAgent).not.toHaveBeenCalled();
+  });
+
+  // ── canonical runId 与 exactly-once settlement ────────────
+
+  it("propagates the canonical runId through ack, RUN_STARTED, options, and RUN_FINISHED", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSession.mockReturnValue({ id: "chat-identity", mode: "chat" });
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sent: Array<{ type?: string; runId?: string }> = [];
+    const sender = {
+      isDestroyed: () => false,
+      send: (_channel: string, event: { type?: string; runId?: string }) => sent.push(event),
+    };
+
+    registerAgUiIpc(
+      async () => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: [],
+          timeoutMs: 1000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: "hi",
+      }),
+      async () => {},
+      () => null,
+    );
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    const ack = await handler(
+      { sender },
+      { assistantTurnId: "fixture-25308", messages: [{ role: "user", content: "hi" }], sessionId: "chat-identity" },
+    ) as { runId: string };
+
+    await expect.poll(() => sent.some((event) => event.type === "RUN_FINISHED")).toBe(true);
+
+    // ack.runId 必须存在
+    expect(ack.runId).toBeTruthy();
+
+    // CyreneAgent.runWithEvents 必须收到 options.runId === ack.runId
+    expect(mocks.runCyreneAgent).toHaveBeenCalledWith(expect.objectContaining({
+      runId: ack.runId,
+    }));
+
+    // RUN_STARTED 与 RUN_FINISHED 的 runId 必须与 ack.runId 一致
+    const runStarted = sent.find((event) => event.type === "RUN_STARTED");
+    const runFinished = sent.find((event) => event.type === "RUN_FINISHED");
+    expect(runStarted?.runId).toBe(ack.runId);
+    expect(runFinished?.runId).toBe(ack.runId);
+  });
+
+  it("drops duplicate RUN_FINISHED events so the renderer only sees one terminal", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSession.mockReturnValue({ id: "chat-dup", mode: "chat" });
+    mocks.emitDuplicateRunFinished = true;
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sent: Array<{ type?: string }> = [];
+    const sender = {
+      isDestroyed: () => false,
+      send: (_channel: string, event: { type?: string }) => sent.push(event),
+    };
+
+    registerAgUiIpc(
+      async () => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: [],
+          timeoutMs: 1000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: "hi",
+      }),
+      async () => {},
+      () => null,
+    );
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    await handler(
+      { sender },
+      { assistantTurnId: "fixture-27177", messages: [{ role: "user", content: "hi" }], sessionId: "chat-dup" },
+    );
+
+    await expect.poll(() => sent.some((event) => event.type === "RUN_FINISHED")).toBe(true);
+
+    // 即便 upstream 连发两个 RUN_FINISHED，渲染端只应收到一个
+    const runFinishedCount = sent.filter((event) => event.type === "RUN_FINISHED").length;
+    expect(runFinishedCount).toBe(1);
+  });
+
+  it("suppresses RUN_ERROR after RUN_FINISHED has already settled (success-then-error)", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSession.mockReturnValue({ id: "chat-err-after", mode: "chat" });
+    mocks.errorAfterRunFinished = "boom";
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sent: Array<{ type?: string }> = [];
+    const sender = {
+      isDestroyed: () => false,
+      send: (_channel: string, event: { type?: string }) => sent.push(event),
+    };
+
+    registerAgUiIpc(
+      async () => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: [],
+          timeoutMs: 1000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: "hi",
+      }),
+      async () => {},
+      () => null,
+    );
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    await handler(
+      { sender },
+      { assistantTurnId: "fixture-28662", messages: [{ role: "user", content: "hi" }], sessionId: "chat-err-after" },
+    );
+
+    await expect.poll(() => sent.some((event) => event.type === "RUN_FINISHED")).toBe(true);
+
+    // RUN_FINISHED 必须到达（settlement gate 第一次进入的是 finished）
+    expect(sent.some((event) => event.type === "RUN_FINISHED")).toBe(true);
+    // RUN_ERROR 必须被 gate 丢弃（已结算为 success/finished）
+    expect(sent.some((event) => event.type === "RUN_ERROR")).toBe(false);
+  });
+
+  it("skips onRunFinished side effects when RUN_FINISHED.result.status is cancelled", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSession.mockReturnValue({ id: "chat-cancelled", mode: "chat" });
+    mocks.runFinishedResult = { status: "cancelled", reason: "user_cancelled", externalEffectsMayContinue: true };
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sent: Array<{ type?: string; name?: string }> = [];
+    const sender = {
+      isDestroyed: () => false,
+      send: (_channel: string, event: { type?: string; name?: string }) => sent.push(event),
+    };
+    const onFinished = vi.fn(async () => ({ sticker: "should-not-fire" }));
+
+    registerAgUiIpc(
+      async () => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: [],
+          timeoutMs: 1000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: "hi",
+      }),
+      onFinished,
+      () => null,
+    );
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    await handler(
+      { sender },
+      { assistantTurnId: "fixture-30410", messages: [{ role: "user", content: "hi" }], sessionId: "chat-cancelled" },
+    );
+
+    await expect.poll(() => sent.some((event) => event.type === "RUN_FINISHED")).toBe(true);
+
+    // cancelled 路径不应触发 onRunFinished 成功副作用
+    expect(onFinished).not.toHaveBeenCalled();
+    // 也不应发出 sticker CUSTOM 事件
+    expect(sent.some((event) => event.type === "CUSTOM" && event.name === "cyrene.sticker")).toBe(false);
+    // 但 RUN_FINISHED 本身必须发出
+    expect(sent.some((event) => event.type === "RUN_FINISHED")).toBe(true);
+  });
+
+  // ── 裸 complete（upstream 未发 RUN_FINISHED）必须补发一个合成 RUN_FINISHED ──
+
+  it("synthesizes exactly one RUN_FINISHED when upstream completes without emitting one", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSession.mockReturnValue({ id: "chat-bare-complete", mode: "chat" });
+    // upstream 直接 complete，不发 RUN_FINISHED
+    mocks.skipDefaultRunFinished = true;
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sent: Array<{ type?: string; runId?: string }> = [];
+    const sender = {
+      isDestroyed: () => false,
+      send: (_channel: string, event: { type?: string; runId?: string }) => sent.push(event),
+    };
+
+    registerAgUiIpc(
+      async () => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: [],
+          timeoutMs: 1000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: "hi",
+      }),
+      async () => {},
+      () => null,
+    );
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    const ack = await handler(
+      { sender },
+      { assistantTurnId: "fixture-32220", messages: [{ role: "user", content: "hi" }], sessionId: "chat-bare-complete" },
+    ) as { runId: string };
+
+    await expect.poll(() => sent.some((event) => event.type === "RUN_FINISHED")).toBe(true);
+
+    // 恰好一个 RUN_FINISHED（合成的），不是零个也不是两个
+    const runFinishedCount = sent.filter((event) => event.type === "RUN_FINISHED").length;
+    expect(runFinishedCount).toBe(1);
+    // 合成的 RUN_FINISHED 必须带 canonical runId + success 终态
+    const runFinished = sent.find((event) => event.type === "RUN_FINISHED");
+    expect(runFinished?.runId).toBe(ack.runId);
+    expect(runFinished).toMatchObject({ result: { status: "success", externalEffectsMayContinue: false } });
+    // 不能误发 RUN_ERROR
+    expect(sent.some((event) => event.type === "RUN_ERROR")).toBe(false);
+  });
+
+  // ── 同步 complete 不留幽灵 active run ──
+
+  it("does not register a ghost active run when the Observable completes synchronously", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSession.mockReturnValue({ id: "chat-sync-complete", mode: "chat" });
+    const { registerAgUiIpc, __hasActiveRunForTest } = await import("./agui-bridge");
+    const sender = {
+      isDestroyed: () => false,
+      send: () => {},
+    };
+
+    registerAgUiIpc(
+      async () => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: [],
+          timeoutMs: 1000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: "hi",
+      }),
+      async () => {},
+      () => null,
+    );
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    const ack = await handler(
+      { sender },
+      { assistantTurnId: "fixture-34050", messages: [{ role: "user", content: "hi" }], sessionId: "chat-sync-complete" },
+    ) as { runId: string };
+
+    // 让 microtask 跑完（mock Observable 是同步的，subscribe 返回时已 complete）
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // 关键不变量：run 已结算，绝不能留在 activeRuns 里（否则 cancel 链路会带上幽灵 run）
+    expect(__hasActiveRunForTest(ack.runId)).toBe(false);
+  });
+
+  // ── harness 返回 terminateReason="error" → runtime_error → RUN_ERROR ──
+
+  it("routes harness runtime_error terminal to RUN_ERROR and skips success side effects", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSession.mockReturnValue({ id: "chat-runtime-error", mode: "chat" });
+    // upstream 发 RUN_FINISHED 但 result.status = "runtime_error"
+    mocks.runFinishedResult = { status: "runtime_error", reason: "E_HARNESS_FAILURE", externalEffectsMayContinue: true };
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sent: Array<{ type?: string; name?: string }> = [];
+    const sender = {
+      isDestroyed: () => false,
+      send: (_channel: string, event: { type?: string; name?: string }) => sent.push(event),
+    };
+    const onFinished = vi.fn(async () => ({ sticker: "should-not-fire" }));
+
+    registerAgUiIpc(
+      async () => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: [],
+          timeoutMs: 1000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: "hi",
+      }),
+      onFinished,
+      () => null,
+    );
+
+    const handler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!handler) throw new Error("AGUI_RUN handler was not registered");
+    await handler(
+      { sender },
+      { assistantTurnId: "fixture-35873", messages: [{ role: "user", content: "hi" }], sessionId: "chat-runtime-error" },
+    );
+
+    await expect.poll(() => sent.some((event) => event.type === "RUN_ERROR")).toBe(true);
+
+    // runtime_error 必须走 RUN_ERROR，绝不走 RUN_FINISHED
+    expect(sent.some((event) => event.type === "RUN_ERROR")).toBe(true);
+    expect(sent.some((event) => event.type === "RUN_FINISHED")).toBe(false);
+    // 不能触发成功收尾副作用
+    expect(onFinished).not.toHaveBeenCalled();
+    expect(sent.some((event) => event.type === "CUSTOM" && event.name === "cyrene.sticker")).toBe(false);
+  });
+
+  // ── cancellation propagation（取消传播）───────────────────────────────
+
+  it("AGUI_CANCEL aborts the run's AbortController (not just unsubscribe)", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSession.mockReturnValue({ id: "chat-cancel-1", mode: "chat" });
+    // upstream 永不自动 complete（模拟正在运行）：不发 RUN_FINISHED + 不 complete
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sender = {
+      isDestroyed: () => false,
+      send: () => {},
+    };
+
+    registerAgUiIpc(
+      async () => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: [],
+          timeoutMs: 60000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: "hi",
+      }),
+      async () => {},
+      () => null,
+    );
+
+    const runHandler = mocks.handlers.get(IPC.AGUI_RUN);
+    const cancelHandler = mocks.handlers.get(IPC.AGUI_CANCEL);
+    if (!runHandler || !cancelHandler) throw new Error("handlers not registered");
+
+    const ack = await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-37704", messages: [{ role: "user", content: "hi" }], sessionId: "chat-cancel-1" },
+    ) as { runId: string };
+
+    // 等 CyreneAgent.runWithEvents 被调用
+    await vi.waitFor(() => expect(mocks.runCyreneAgent).toHaveBeenCalledOnce());
+
+    // bridge 必须通过 options.signal 传入 AbortController.signal
+    const passedOptions = mocks.runCyreneAgent.mock.calls[0]?.[0] as { signal?: AbortSignal };
+    expect(passedOptions.signal).toBeDefined();
+    expect(passedOptions.signal!.aborted).toBe(false);
+
+    // 调用 AGUI_CANCEL —— 必须 abort signal，不是 unsubscribe Observable
+    await cancelHandler({}, ack.runId);
+
+    // signal 必须被 abort
+    expect(passedOptions.signal!.aborted).toBe(true);
+  });
+
+  it("cancel one runId does not abort another run's signal", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSession.mockReturnValue({ id: "chat-isolation", mode: "chat" });
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sender = {
+      isDestroyed: () => false,
+      send: () => {},
+    };
+
+    registerAgUiIpc(
+      async () => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: [],
+          timeoutMs: 60000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: "hi",
+      }),
+      async () => {},
+      () => null,
+    );
+
+    const runHandler = mocks.handlers.get(IPC.AGUI_RUN);
+    const cancelHandler = mocks.handlers.get(IPC.AGUI_CANCEL);
+    if (!runHandler || !cancelHandler) throw new Error("handlers not registered");
+
+    // 启动两个 run（会话守卫要求不同会话：跨会话并发是既有能力）
+    const ack1 = await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-39543", messages: [{ role: "user", content: "run1" }], sessionId: "chat-isolation-a" },
+    ) as { runId: string };
+    const ack2 = await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-39712", messages: [{ role: "user", content: "run2" }], sessionId: "chat-isolation-b" },
+    ) as { runId: string };
+
+    await vi.waitFor(() => expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(2));
+
+    const signal1 = (mocks.runCyreneAgent.mock.calls[0]?.[0] as { signal?: AbortSignal }).signal;
+    const signal2 = (mocks.runCyreneAgent.mock.calls[1]?.[0] as { signal?: AbortSignal }).signal;
+    expect(signal1).toBeDefined();
+    expect(signal2).toBeDefined();
+    expect(signal1).not.toBe(signal2);
+
+    // cancel run1 —— 绝不能影响 run2
+    await cancelHandler({}, ack1.runId);
+
+    expect(signal1!.aborted).toBe(true);
+    expect(signal2!.aborted).toBe(false);
+  });
+
+  it("AGUI_CANCEL with no runId aborts all active runs", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSession.mockReturnValue({ id: "chat-cancel-all", mode: "chat" });
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    const { registerAgUiIpc } = await import("./agui-bridge");
+    const sender = {
+      isDestroyed: () => false,
+      send: () => {},
+    };
+
+    registerAgUiIpc(
+      async () => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: [],
+          timeoutMs: 60000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: "hi",
+      }),
+      async () => {},
+      () => null,
+    );
+
+    const runHandler = mocks.handlers.get(IPC.AGUI_RUN);
+    const cancelHandler = mocks.handlers.get(IPC.AGUI_CANCEL);
+    if (!runHandler || !cancelHandler) throw new Error("handlers not registered");
+
+    await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-41483", messages: [{ role: "user", content: "run1" }], sessionId: "chat-cancel-all-a" },
+    );
+    await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-41619", messages: [{ role: "user", content: "run2" }], sessionId: "chat-cancel-all-b" },
+    );
+
+    await vi.waitFor(() => expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(2));
+
+    const signal1 = (mocks.runCyreneAgent.mock.calls[0]?.[0] as { signal?: AbortSignal }).signal;
+    const signal2 = (mocks.runCyreneAgent.mock.calls[1]?.[0] as { signal?: AbortSignal }).signal;
+
+    // 无 runId → abort 全部
+    await cancelHandler({}, undefined);
+
+    expect(signal1!.aborted).toBe(true);
+    expect(signal2!.aborted).toBe(true);
+  });
+});
+
+// ── 会话级运行守卫 ──────────────────────────────────────
+// 同一会话同一时刻最多一个 active run；不同会话允许并发。
+// 渲染端 busy 队列只是 UX 优化，主进程守卫才是跨进程最终一致性边界。
+describe("agui-bridge session run guard", () => {
+  const defaultBuildOptions = async () => ({
+    options: {
+      settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+      messages: [],
+      timeoutMs: 60000,
+      toolSystemContent: "TOOL",
+      soulSystemBaseContent: "SOUL",
+    },
+    latestUserText: "hi",
+  });
+
+  function makeSender() {
+    return { isDestroyed: () => false, send: () => {} };
+  }
+
+  beforeEach(() => {
+    mocks.runFinishedResult = undefined;
+    mocks.emitDuplicateRunFinished = false;
+    mocks.errorAfterRunFinished = null;
+    mocks.skipDefaultRunFinished = false;
+    mocks.neverComplete = false;
+    mocks.completeOnAbort = false;
+    mocks.getSessionRecord.mockReset();
+    mocks.getPendingDispatch.mockReset();
+    mocks.composeSession.mockReset();
+  });
+
+  async function setupBridge(buildOptions = defaultBuildOptions) {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    const bridge = await import("./agui-bridge");
+    bridge.registerAgUiIpc(buildOptions, async () => {}, () => null);
+    const runHandler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!runHandler) throw new Error("AGUI_RUN handler was not registered");
+    return { bridge, runHandler };
+  }
+
+  it("serializes Learn vault runs and releases the slot after cancellation", async () => {
+    mocks.getSession.mockImplementation((id: string) => ({ id, mode: "learn", messages: [], workspaceBinding: { workspaceRoot: mocks.userDataRoot, boundAt: 1 } }));
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    const { bridge, runHandler } = await setupBridge();
+    const sender = makeSender();
+    const first = await runHandler({ sender }, { sessionId: "vault-a", assistantTurnId: "a" }) as { runId: string };
+    await expect(runHandler({ sender }, { sessionId: "vault-b", assistantTurnId: "b" })).rejects.toThrow("LEARN_RUN_ACTIVE");
+    expect(bridge.__getSessionActiveRunForTest("vault-a")).toBe(first.runId);
+    expect(bridge.__getSessionActiveRunForTest("vault-b")).toBeUndefined();
+    mocks.handlers.get(IPC.AGUI_CANCEL)!({}, first.runId);
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("vault-a")).toBeUndefined();
+    const second = await runHandler({ sender }, { sessionId: "vault-b", assistantTurnId: "b-retry" }) as { runId: string };
+    expect(bridge.__getSessionActiveRunForTest("vault-b")).toBe(second.runId);
+    mocks.handlers.get(IPC.AGUI_CANCEL)!({}, second.runId);
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("vault-b")).toBeUndefined();
+  });
+
+  it.each(['zh-CN', 'en', 'ja-JP'])("Learn 忙碌提示在 %s 下无需 renderer 检查点即可从真实存储恢复", async (locale) => {
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    const { bridge, runHandler } = await setupBridge();
+    const { getConversationDatabase } = await import('./storage/conversation-database-client');
+    const { updateLocaleContext } = await import('./locale-context');
+    const translations = await import(`../renderer/react/i18n/${locale === 'en' ? 'en' : locale}.json`);
+    updateLocaleContext({ uiLocale: locale });
+    const database = getConversationDatabase(mocks.userDataRoot);
+    const create = async () => {
+      const session = await database.call<any>('chats.createSession', { mode: 'learn' });
+      await database.call('chats.setWorkspaceBinding', session.id, { workspaceRoot: mocks.userDataRoot, boundAt: 1 });
+      return session;
+    };
+    const firstSession = await create();
+    const secondSession = await create();
+    await database.call('chats.enqueuePendingMessage', secondSession.id, { id: 'busy-user', rawContent: '学习问题', visibleContent: '学习问题' });
+    expect(await database.call('chats.claimPendingMessage', secondSession.id)).toMatchObject({ ok: true, claimed: true });
+    mocks.getSession.mockImplementation((id: string) => database.call('chats.getSession', id));
+    const sender = makeSender();
+    const first = await runHandler({ sender }, { sessionId: firstSession.id, assistantTurnId: 'first' }) as { runId: string };
+    try {
+      const input = { sessionId: secondSession.id, assistantTurnId: 'busy-assistant', currentUser: { turnId: 'busy-user', text: '学习问题', visibleContent: '学习问题' } };
+      await expect(runHandler({ sender }, input)).rejects.toThrow('LEARN_RUN_ACTIVE');
+      expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+      expect(bridge.__getSessionActiveRunForTest(firstSession.id)).toBe(first.runId);
+      expect(bridge.__getSessionActiveRunForTest(secondSession.id)).toBeUndefined();
+      await closeConversationDatabases();
+      const restored = await database.call<any>('chats.getSession', secondSession.id);
+      expect(restored.messages).toHaveLength(2);
+      expect(restored.messages[0]).toMatchObject({ role: 'user', content: '学习问题' });
+      expect(restored.messages[1]).toMatchObject({ id: 'busy-assistant', role: 'model', content: '',
+        processMessages: [{ content: translations.default.chatPage.learnRunActiveNotice }],
+        runSnapshot: { status: 'terminal', terminalStatus: 'runtime_error' } });
+    } finally {
+      updateLocaleContext({ uiLocale: 'zh-CN' });
+      mocks.handlers.get(IPC.AGUI_CANCEL)!({}, first.runId);
+      await expect.poll(() => bridge.__getSessionActiveRunForTest(firstSession.id)).toBeUndefined();
+    }
+  });
+
+  it("rejects a second same-session run with SESSION_RUN_ACTIVE while the first is unsettled", async () => {
+    mocks.getSession.mockReturnValue({ id: "guard-1", mode: "chat" });
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    const { bridge, runHandler } = await setupBridge();
+    const sender = makeSender();
+
+    const ack1 = await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-43973", messages: [{ role: "user", content: "run1" }], sessionId: "guard-1" },
+    ) as { runId: string };
+    expect(bridge.__getSessionActiveRunForTest("guard-1")).toBe(ack1.runId);
+
+    // 不带 takeoverFromRunId 的同会话第二个 run → 拒绝，错误带稳定前缀 + active runId
+    await expect(runHandler(
+      { sender },
+      { assistantTurnId: "fixture-44273", messages: [{ role: "user", content: "run2" }], sessionId: "guard-1" },
+    )).rejects.toThrow(`SESSION_RUN_ACTIVE:${ack1.runId}`);
+
+    // 拒绝不得影响第一个 run：守卫仍指向 run1
+    expect(bridge.__getSessionActiveRunForTest("guard-1")).toBe(ack1.runId);
+  });
+
+  it("releases the guard after the first run settles, allowing a new run", async () => {
+    mocks.getSession.mockReturnValue({ id: "guard-2", mode: "chat" });
+    const { bridge, runHandler } = await setupBridge();
+    const sender = makeSender();
+
+    const ack1 = await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-44832", messages: [{ role: "user", content: "run1" }], sessionId: "guard-2" },
+    ) as { runId: string };
+    // complete 回调链路（副作用 → endLifecycle）是异步的：等守卫真实释放
+    await vi.waitFor(() => expect(bridge.__getSessionActiveRunForTest("guard-2")).toBeUndefined());
+
+    const ack2 = await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-45146", messages: [{ role: "user", content: "run2" }], sessionId: "guard-2" },
+    ) as { runId: string };
+    expect(ack2.runId).toBeTruthy();
+    expect(bridge.__getSessionActiveRunForTest("guard-2")).toBe(ack2.runId);
+  });
+
+  it("takeover aborts the active run, waits for settlement, then starts the new run", async () => {
+    mocks.getSession.mockReturnValue({ id: "guard-3", mode: "chat" });
+    // completeOnAbort：abort 触发 RUN_FINISHED(cancelled) + complete 的真实结算链路
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    mocks.completeOnAbort = true;
+    const { bridge, runHandler } = await setupBridge();
+    const sender = makeSender();
+
+    const ack1 = await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-45870", messages: [{ role: "user", content: "run1" }], sessionId: "guard-3" },
+    ) as { runId: string };
+
+    const ack2 = await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-46031",
+        messages: [{ role: "user", content: "run2" }],
+        sessionId: "guard-3",
+        takeoverFromRunId: ack1.runId,
+      },
+    ) as { runId: string };
+
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(2);
+    // 旧 run 被 takeover abort（cancelled 结算），新 run 的 signal 干净
+    const signal1 = (mocks.runCyreneAgent.mock.calls[0]?.[0] as { signal?: AbortSignal }).signal;
+    const signal2 = (mocks.runCyreneAgent.mock.calls[1]?.[0] as { signal?: AbortSignal }).signal;
+    expect(signal1!.aborted).toBe(true);
+    expect(signal2!.aborted).toBe(false);
+    // 守卫已易主到新 run
+    expect(bridge.__getSessionActiveRunForTest("guard-3")).toBe(ack2.runId);
+  });
+
+  it("rejects takeover when takeoverFromRunId does not match the active run", async () => {
+    mocks.getSession.mockReturnValue({ id: "guard-4", mode: "chat" });
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    const { bridge, runHandler } = await setupBridge();
+    const sender = makeSender();
+
+    const ack1 = await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-47083", messages: [{ role: "user", content: "run1" }], sessionId: "guard-4" },
+    ) as { runId: string };
+
+    await expect(runHandler(
+      { sender },
+      { assistantTurnId: "fixture-47238",
+        messages: [{ role: "user", content: "run2" }],
+        sessionId: "guard-4",
+        takeoverFromRunId: "stale-or-wrong-run-id",
+      },
+    )).rejects.toThrow(`SESSION_RUN_ACTIVE:${ack1.runId}`);
+
+    expect(bridge.__getSessionActiveRunForTest("guard-4")).toBe(ack1.runId);
+  });
+
+  it("throws SESSION_RUN_TAKEOVER_STUCK when the active run never settles after abort", async () => {
+    mocks.getSession.mockReturnValue({ id: "guard-5", mode: "chat" });
+    // abort 后旧 run 永不结算（模拟 settlement 链路自身故障）
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    mocks.completeOnAbort = false;
+    const { bridge, runHandler } = await setupBridge();
+    bridge.__setTakeoverSettleTimeoutForTest(10);
+    const sender = makeSender();
+
+    const ack1 = await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-48058", messages: [{ role: "user", content: "run1" }], sessionId: "guard-5" },
+    ) as { runId: string };
+
+    await expect(runHandler(
+      { sender },
+      { assistantTurnId: "fixture-48213",
+        messages: [{ role: "user", content: "run2" }],
+        sessionId: "guard-5",
+        takeoverFromRunId: ack1.runId,
+      },
+    )).rejects.toThrow(`SESSION_RUN_TAKEOVER_STUCK:${ack1.runId}`);
+  });
+
+  it("concurrent takeovers of the same run: exactly one wins, the loser is rejected", async () => {
+    mocks.getSession.mockReturnValue({ id: "guard-6", mode: "chat" });
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    mocks.completeOnAbort = true;
+    const { bridge, runHandler } = await setupBridge();
+    const sender = makeSender();
+
+    const ack1 = await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-48850", messages: [{ role: "user", content: "run1" }], sessionId: "guard-6" },
+    ) as { runId: string };
+
+    // 两个 takeover 同 tick 发起：旧 run 结算后双双醒来重新竞争守卫，恰一个注册成功
+    const [first, second] = await Promise.allSettled([
+      runHandler({ sender }, { assistantTurnId: "fixture-49106",
+        messages: [{ role: "user", content: "a" }],
+        sessionId: "guard-6",
+        takeoverFromRunId: ack1.runId,
+      }),
+      runHandler({ sender }, { assistantTurnId: "fixture-49268",
+        messages: [{ role: "user", content: "b" }],
+        sessionId: "guard-6",
+        takeoverFromRunId: ack1.runId,
+      }),
+    ]);
+
+    const outcomes = [first.status, second.status].sort();
+    expect(outcomes).toEqual(["fulfilled", "rejected"]);
+    // 输家的 takeoverFromRunId 已不匹配新 active run → SESSION_RUN_ACTIVE（指向赢家）
+    const rejected = first.status === "rejected" ? first : second as PromiseRejectedResult;
+    expect((rejected as PromiseRejectedResult).reason.message).toMatch(/^SESSION_RUN_ACTIVE:/);
+    // 守卫恰好指向赢家
+    const fulfilled = first.status === "fulfilled" ? first : second as PromiseFulfilledResult<{ runId: string }>;
+    expect(bridge.__getSessionActiveRunForTest("guard-6")).toBe((fulfilled as PromiseFulfilledResult<{ runId: string }>).value.runId);
+  });
+
+  it("release is compare-and-delete: a mismatched runId never drops the guard", async () => {
+    mocks.getSession.mockReturnValue({ id: "guard-7", mode: "chat" });
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    const { bridge, runHandler } = await setupBridge();
+    const sender = makeSender();
+
+    const ack1 = await runHandler(
+      { sender },
+      { assistantTurnId: "fixture-50433", messages: [{ role: "user", content: "run1" }], sessionId: "guard-7" },
+    ) as { runId: string };
+
+    // 旧 run 迟到的清理（runId 不匹配）不得误删当前守卫
+    bridge.__releaseSessionGuardForTest("guard-7", "some-other-run");
+    expect(bridge.__getSessionActiveRunForTest("guard-7")).toBe(ack1.runId);
+
+    // 匹配的 runId 才释放
+    bridge.__releaseSessionGuardForTest("guard-7", ack1.runId);
+    expect(bridge.__getSessionActiveRunForTest("guard-7")).toBeUndefined();
+  });
+
+  it("releases the session guard when buildOptions throws after registration", async () => {
+    mocks.getSession.mockReturnValue({ id: "guard-8", mode: "chat" });
+    const failingBuildOptions = async () => {
+      throw new Error("boom: build options failed");
+    };
+    const { bridge, runHandler } = await setupBridge(failingBuildOptions);
+    const sender = makeSender();
+
+    await expect(runHandler(
+      { sender },
+      { assistantTurnId: "fixture-51321", messages: [{ role: "user", content: "run1" }], sessionId: "guard-8" },
+    )).rejects.toThrow("boom: build options failed");
+
+    // 早期退出路径必须释放守卫，否则该会话永久拒绝新 run
+    expect(bridge.__getSessionActiveRunForTest("guard-8")).toBeUndefined();
+  });
+
+  it("same-tick concurrent runs on one session: exactly one registers", async () => {
+    mocks.getSession.mockReturnValue({ id: "guard-9", mode: "chat" });
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    const { runHandler } = await setupBridge();
+    const sender = makeSender();
+
+    const [first, second] = await Promise.allSettled([
+      runHandler({ sender }, { assistantTurnId: "fixture-51976", messages: [{ role: "user", content: "a" }], sessionId: "guard-9" }),
+      runHandler({ sender }, { assistantTurnId: "fixture-52076", messages: [{ role: "user", content: "b" }], sessionId: "guard-9" }),
+    ]);
+
+    // 守卫注册在同步代码块内完成（get 与 set 之间无 await）→ 同 tick 竞态下恰一个赢
+    expect([first.status, second.status].sort()).toEqual(["fulfilled", "rejected"]);
+    const rejected = first.status === "rejected" ? first : second as PromiseRejectedResult;
+    expect((rejected as PromiseRejectedResult).reason.message).toMatch(/^SESSION_RUN_ACTIVE:/);
+  });
+});
+
+describe("agui-bridge pending adjust IPC", () => {
+  const defaultBuildOptions = async () => ({
+    options: {
+      settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+      messages: [],
+      timeoutMs: 60000,
+      toolSystemContent: "TOOL",
+      soulSystemBaseContent: "SOUL",
+    },
+    latestUserText: "hi",
+  });
+
+  function makeSender() {
+    return { isDestroyed: () => false, send: () => {} };
+  }
+
+  beforeEach(() => {
+    mocks.runFinishedResult = undefined;
+    mocks.emitDuplicateRunFinished = false;
+    mocks.errorAfterRunFinished = null;
+    mocks.skipDefaultRunFinished = false;
+    mocks.neverComplete = false;
+    mocks.completeOnAbort = false;
+    mocks.getSession.mockReset();
+    mocks.getPendingMessages.mockReset();
+    mocks.markPendingAdjust.mockReset();
+    mocks.resetPendingAdjustByRun.mockReset();
+    mocks.getSessionRecord.mockReset();
+    mocks.getPendingDispatch.mockReset();
+    mocks.composeSession.mockReset();
+  });
+
+  async function setupBridge(buildOptions = defaultBuildOptions) {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    const bridge = await import("./agui-bridge");
+    bridge.registerAgUiIpc(buildOptions, async () => {}, () => null);
+    const adjustHandler = mocks.handlers.get(IPC.CHATS_PENDING_ADJUST);
+    const runHandler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!adjustHandler || !runHandler) {
+      throw new Error("CHATS_PENDING_ADJUST / AGUI_RUN handlers were not registered");
+    }
+    return { bridge, adjustHandler, runHandler };
+  }
+
+  it("载荷校验与会话不存在：invalid-payload / session-not-found", async () => {
+    mocks.getSession.mockReturnValue(null);
+    const { adjustHandler } = await setupBridge();
+    const sender = makeSender();
+
+    expect(await adjustHandler({ sender }, null)).toEqual({ ok: false, error: "invalid-payload" });
+    expect(await adjustHandler({ sender }, { sessionId: "", messageId: "q-1" })).toEqual({
+      ok: false,
+      error: "invalid-payload",
+    });
+    expect(await adjustHandler({ sender }, { sessionId: "missing", messageId: "q-1" })).toEqual({
+      ok: false,
+      error: "session-not-found",
+    });
+    expect(mocks.markPendingAdjust).not.toHaveBeenCalled();
+  });
+
+  it("无活跃运行：no-active-run 并返回最新权威队列（消息留在普通队列）", async () => {
+    mocks.getSession.mockReturnValue({ id: "adj-1", mode: "work" });
+    mocks.getPendingMessages.mockReturnValue([{ id: "q-1", rawContent: "排队中", visibleContent: "排队中", enqueuedAt: 1 }]);
+    const { adjustHandler } = await setupBridge();
+    const sender = makeSender();
+
+    const result = await adjustHandler({ sender }, { sessionId: "adj-1", messageId: "q-1" });
+    expect(result).toEqual({
+      ok: false,
+      error: "no-active-run",
+      queue: [expect.objectContaining({ id: "q-1" })],
+    });
+    expect(mocks.markPendingAdjust).not.toHaveBeenCalled();
+  });
+
+  it("Chat 模式没有安全的下一步：no-safe-next-step 并返回队列", async () => {
+    mocks.getSession.mockReturnValue({ id: "adj-2", mode: "chat" });
+    mocks.getPendingMessages.mockReturnValue([]);
+    const { adjustHandler, runHandler } = await setupBridge();
+    const sender = makeSender();
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    await runHandler({ sender }, { assistantTurnId: "fixture-55784", messages: [{ role: "user", content: "run" }], sessionId: "adj-2" });
+
+    const result = await adjustHandler({ sender }, { sessionId: "adj-2", messageId: "q-1" });
+    expect(result).toEqual({ ok: false, error: "no-safe-next-step", queue: [] });
+    expect(mocks.markPendingAdjust).not.toHaveBeenCalled();
+  });
+
+  it("Work 模式活跃运行：以会话当前活跃 runId 标记插话并透传结果", async () => {
+    mocks.getSession.mockReturnValue({
+      id: "adj-3",
+      mode: "work",
+      workspaceBinding: { workspaceRoot: "C:\\workspace", displayName: "workspace", boundAt: 1 },
+    });
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    const { bridge, adjustHandler, runHandler } = await setupBridge();
+    const sender = makeSender();
+    const ack = await runHandler({ sender }, { assistantTurnId: "fixture-56563",
+      messages: [{ role: "user", content: "执行任务" }],
+      sessionId: "adj-3",
+    }) as { runId: string };
+    expect(bridge.__getSessionActiveRunForTest("adj-3")).toBe(ack.runId);
+
+    mocks.markPendingAdjust.mockReturnValue({ ok: true, queue: [{ id: "q-1", adjustRunId: ack.runId }] });
+    const result = await adjustHandler({ sender }, { sessionId: "adj-3", messageId: "q-1" });
+    // 绑定的是会话当前活跃运行（会话级守卫是唯一可信来源）
+    expect(mocks.markPendingAdjust).toHaveBeenCalledWith("adj-3", "q-1", ack.runId);
+    expect(result).toEqual({
+      ok: true,
+      queue: [expect.objectContaining({ id: "q-1", adjustRunId: ack.runId })],
+    });
+  });
+
+  it("v2 会话的 pending adjust 通过 composed loader，不因同步 getSession 为空而误报不存在", async () => {
+    mocks.getSession.mockReturnValue(null);
+    const record = {
+      id: "adj-v2",
+      title: "v2 调整",
+      identityId: null,
+      createdAt: 1,
+      updatedAt: 1,
+      schemaVersion: 2,
+      messageCount: 0,
+      mode: "work",
+      workspaceBinding: { workspaceRoot: "C:\\workspace", displayName: "workspace", boundAt: 1 },
+    };
+    mocks.getSessionRecord.mockReturnValue(record);
+    mocks.getPendingDispatch.mockReturnValue(null);
+    mocks.composeSession.mockImplementation((_record: unknown, messages: unknown[]) => ({ ...record, schemaVersion: 1, messages }));
+    mocks.getPendingMessages.mockReturnValue([]);
+    const { bridge, adjustHandler, runHandler } = await setupBridge();
+    const sender = makeSender();
+    mocks.skipDefaultRunFinished = true;
+    mocks.neverComplete = true;
+    const ack = await runHandler({ sender }, { assistantTurnId: "fixture-58147",
+      messages: [{ role: "user", content: "执行任务" }], sessionId: "adj-v2",
+    }) as { runId: string };
+    mocks.markPendingAdjust.mockReturnValue({ ok: true, queue: [{ id: "q-v2", adjustRunId: ack.runId }] });
+    const result = await adjustHandler({ sender }, { sessionId: "adj-v2", messageId: "q-v2" });
+    expect(bridge.__getSessionActiveRunForTest("adj-v2")).toBe(ack.runId);
+    expect(mocks.markPendingAdjust).toHaveBeenCalledWith("adj-v2", "q-v2", ack.runId);
+    expect(result).toEqual(expect.objectContaining({ ok: true }));
+  });
+
+  it("运行结束复位：run 结算后已标记未注入的条目清标记回普通队列", async () => {
+    mocks.getSession.mockReturnValue({
+      id: "adj-4",
+      mode: "work",
+      workspaceBinding: { workspaceRoot: "C:\\workspace", displayName: "workspace", boundAt: 1 },
+    });
+    const { bridge, runHandler } = await setupBridge();
+    const sender = makeSender();
+    const ack = await runHandler({ sender }, { assistantTurnId: "fixture-59064",
+      messages: [{ role: "user", content: "很快结束" }],
+      sessionId: "adj-4",
+    }) as { runId: string };
+
+    // run 自然结算（complete 回调 → endLifecycle）：插话标记按 runId 复位
+    await vi.waitFor(() => expect(bridge.__getSessionActiveRunForTest("adj-4")).toBeUndefined());
+    expect(mocks.resetPendingAdjustByRun).toHaveBeenCalledWith("adj-4", ack.runId);
+  });
+
+  it("buildOptions 失败的早期退出同样复位插话标记（消息不困在标记态）", async () => {
+    mocks.getSession.mockReturnValue({
+      id: "adj-5",
+      mode: "work",
+      workspaceBinding: { workspaceRoot: "C:\\workspace", displayName: "workspace", boundAt: 1 },
+    });
+    const { runHandler } = await setupBridge(async () => {
+      throw new Error("boom: build options failed");
+    });
+    const sender = makeSender();
+
+    await expect(runHandler({ sender }, { assistantTurnId: "fixture-59862",
+      messages: [{ role: "user", content: "run" }],
+      sessionId: "adj-5",
+    })).rejects.toThrow("boom: build options failed");
+
+    expect(mocks.resetPendingAdjustByRun).toHaveBeenCalled();
+  });
+});
+
+describe("agui-bridge background shell smoke (mock sessions, isolated SQLite)", () => {
+  let bridge: typeof import("./agui-bridge");
+  beforeEach(async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockReset();
+    mocks.getSessionRecord.mockReset();
+    mocks.composeSession.mockReset();
+    mocks.agentEvents = [];
+    mocks.runFinishedResult = undefined;
+    mocks.emitDuplicateRunFinished = false;
+    mocks.errorAfterRunFinished = null;
+    mocks.skipDefaultRunFinished = false;
+    mocks.neverComplete = false;
+    mocks.completeOnAbort = false;
+    mocks.resetPendingAdjustByRun.mockResolvedValue({ ok: true, reset: 0 });
+    mocks.getPendingMessages.mockResolvedValue([]);
+    mocks.getSession.mockImplementation((id: string) => ({ id, mode: "code", messages: [],
+      workspaceBinding: { workspaceRoot: mocks.userDataRoot, displayName: "isolated", boundAt: 1 } }));
+    bridge = await import("./agui-bridge");
+    bridge.registerAgUiIpc(async input => ({ options: {
+      settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "", contextWindowTokens: 256000 },
+      messages: input.modelContext?.messages ?? [], conversationId: input.sessionId,
+      timeoutMs: 1000, toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL",
+    }, latestUserText: "fixture" }), async () => {}, () => null);
+  });
+  afterEach(async () => {
+    await bridge.disposeShellCompletionDispatch();
+    mocks.beforeAbortSettlement = null;
+    mocks.skipDefaultRunFinished = false;
+    mocks.neverComplete = false;
+    mocks.completeOnAbort = false;
+    vi.doUnmock("child_process");
+  });
+  const snapshot = (jobId = "job-smoke") => ({ jobId, pid: null, status: "exited" as const, exitCode: 7,
+    reason: null, totalBytes: 4, logFile: "fixture.log", command: "fixture", shell: "cmd", startedAt: "2026-01-01", durationMs: 10, tail: "done" });
+  async function start() {
+    await mocks.handlers.get(IPC.AGUI_RUN)!({ sender: { isDestroyed: () => false, send: vi.fn() } },
+      { sessionId: "original", assistantTurnId: "initial" });
+    return mocks.runCyreneAgent.mock.calls[0][0] as import("./orchestrator/cyrene-agent").CyreneRunOptions;
+  }
+
+  it("defers a Learn completion until another vault run settles", async () => {
+    mocks.getSession.mockImplementation((id: string) => ({ id, mode: "learn", messages: [],
+      workspaceBinding: { workspaceRoot: path.join(mocks.userDataRoot, id), displayName: id, boundAt: 1 } }));
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    await mocks.handlers.get(IPC.AGUI_RUN)!({}, { sessionId: "other-vault", assistantTurnId: "other" });
+    const other = mocks.runCyreneAgent.mock.calls[1][0];
+    original.onShellJobComplete!(snapshot("learn-wait"));
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    await expect.poll(async () => (await store.readAuditEntries("original")).some(entry => entry.kind === "background_event_pending")).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(2);
+    expect((await store.readAuditEntries("original")).some(entry => entry.kind === "background_event")).toBe(false);
+    mocks.finishRuns.get(other.runId)!();
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length, { timeout: 3000 }).toBe(3);
+    expect(JSON.stringify(mocks.runCyreneAgent.mock.calls[2][0].messages)).toContain("learn-wait");
+  });
+
+  it("rejects a foreground Learn run while another vault continuation is active", async () => {
+    mocks.getSession.mockImplementation((id: string) => ({ id, mode: "learn", messages: [],
+      workspaceBinding: { workspaceRoot: path.join(mocks.userDataRoot, id), displayName: id, boundAt: 1 } }));
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    original.onShellJobComplete!(snapshot("learn-active"));
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    await expect(mocks.handlers.get(IPC.AGUI_RUN)!({}, { sessionId: "other-vault", assistantTurnId: "other" })).rejects.toThrow("LEARN_RUN_ACTIVE");
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(2);
+    expect(bridge.__getSessionActiveRunForTest("other-vault")).toBeUndefined();
+  });
+
+  it("persists busy completions at delivery after the unrelated assistant response", async () => {
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    const original = await start();
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    const journal = new ConversationJournalService({ store });
+    original.onShellJobComplete!(snapshot("busy-result"));
+    await expect.poll(async () => (await store.readAuditEntries("original")).length).toBeGreaterThan(0);
+    expect(JSON.stringify((await journal.buildModelContext("original")).messages)).not.toContain("busy-result");
+    await store.append("original", { kind: "assistant", id: "unrelated-response", at: 1, payload: { role: "assistant", content: "UNRELATED_RESPONSE" } });
+    const delivered = await original.pollShellCompletions!();
+    expect(delivered).toHaveLength(1);
+    await store.append("original", { kind: "assistant", id: "follow-up", at: 2, payload: { role: "assistant", content: "FOLLOW_UP" } });
+    const replay = (await journal.buildModelContext("original")).messages.map(message => message.content);
+    expect(replay).toEqual(["UNRELATED_RESPONSE", delivered[0].content, "FOLLOW_UP"]);
+    const { buildCompactionSourceView } = await import("./orchestrator/conversation-transcript-projection");
+    const compacting = buildCompactionSourceView((await store.read("original")).entries, { get: () => null });
+    expect(compacting.messages.map(message => message.content)).toEqual(replay);
+    expect(await original.pollShellCompletions!()).toEqual([]);
+  });
+
+  it("a rolled-back deletion resumes queued and future automatic completions", async () => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    const rollback = await bridge.prepareBackgroundSessionMutation("original");
+    original.onShellJobComplete!(snapshot("during-delete"));
+    await new Promise(resolve => setTimeout(resolve, 40));
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+    rollback();
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    original.onShellJobComplete!(snapshot("after-rollback"));
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(3);
+  });
+
+  it.each(["different-root", "same-root-new-generation"])("stamps completions with the workspace used by preparation: %s", async scenario => {
+    const a = { workspaceRoot: mocks.userDataRoot, displayName: "A", boundAt: 1 };
+    const b = { workspaceRoot: scenario === "different-root" ? path.join(mocks.userDataRoot, "B") : mocks.userDataRoot, displayName: "B", boundAt: 2 };
+    let binding = a;
+    mocks.getSession.mockImplementation((id: string) => ({ id, mode: "code", messages: [], workspaceBinding: binding }));
+    bridge.registerAgUiIpc(async input => {
+      // bridge 已读取 A；模拟构建参数前 CHATS_SET_WORKSPACE 提交了 B。
+      binding = b;
+      return { options: { settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+        messages: input.modelContext?.messages ?? [], resolvedWorkspaceRoot: b.workspaceRoot, resolvedWorkspaceBinding: b,
+        toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" }, latestUserText: "fixture" };
+    }, async () => {}, () => null);
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    original.onShellJobComplete!(snapshot("effective-workspace"));
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+    expect(JSON.stringify(resumed.messages)).toContain("effective-workspace");
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const entries = await getConversationTranscriptStore(mocks.userDataRoot).readAuditEntries("original");
+    expect(entries).toContainEqual(expect.objectContaining({ kind: "background_event", payload: expect.objectContaining({
+      jobId: "effective-workspace", sourceWorkspace: JSON.stringify([b.workspaceRoot, b.boundAt]),
+    }) }));
+    expect(entries.some(entry => entry.kind === "background_event_retired")).toBe(false);
+  });
+
+  it.each(["poll", "settle"])("delivers after registration while the old foreground run is busy: %s", async boundary => {
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    const original = await start();
+    bridge.registerAgUiIpc(async input => ({ options: { settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+      messages: input.modelContext?.messages ?? [], toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" }, latestUserText: "fixture" }), async () => {}, () => null);
+    original.onShellJobComplete!(snapshot("late-while-busy"));
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    await expect.poll(async () => (await store.readAuditEntries("original")).some(entry => entry.kind === "background_event_pending")).toBe(true);
+    if (boundary === "poll") {
+      expect(await original.pollShellCompletions!()).toHaveLength(1);
+      expect(await original.pollShellCompletions!()).toEqual([]);
+    }
+    mocks.skipDefaultRunFinished = false; mocks.neverComplete = false;
+    mocks.finishRuns.get(original.runId!)!();
+    if (boundary === "settle") {
+      await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+      expect(JSON.stringify(mocks.runCyreneAgent.mock.calls[1][0].messages)).toContain("late-while-busy");
+    }
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    expect((await store.readAuditEntries("original")).filter(entry => entry.kind === "background_event")).toHaveLength(1);
+  });
+
+  it("routes late shell callbacks to the current dispatcher after registration", async () => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    bridge.registerAgUiIpc(async input => ({ options: { settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+      messages: input.modelContext?.messages ?? [], toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" }, latestUserText: "fixture" }), async () => {}, () => null);
+    original.onShellJobComplete!(snapshot("late-after-registration"));
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+    expect(JSON.stringify(resumed.messages)).toContain("late-after-registration");
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const audit = await getConversationTranscriptStore(mocks.userDataRoot).readAuditEntries("original");
+    expect(audit.filter(entry => entry.kind === "background_event_pending")).toHaveLength(1);
+    expect(audit.filter(entry => entry.kind === "background_event")).toHaveLength(1);
+  });
+
+  it.each(["reregister", "restart"])("recovers durable pending results only on explicit run after %s", async scenario => {
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    const original = await start();
+    original.onShellJobComplete!(snapshot("recover-pending"));
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    await expect.poll(async () => (await store.readAuditEntries("original")).some(entry => entry.kind === "background_event_pending")).toBe(true);
+    mocks.handlers.get(IPC.AGUI_CANCEL)!({}, original.runId);
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    await bridge.disposeShellCompletionDispatch();
+    if (scenario === "restart") {
+      await closeConversationDatabases();
+      vi.resetModules();
+      bridge = await import("./agui-bridge");
+    }
+    bridge.registerAgUiIpc(async input => ({ options: { settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+      messages: input.modelContext?.messages ?? [], toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" }, latestUserText: "fixture" }), async () => {}, () => null);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+    await mocks.handlers.get(IPC.AGUI_RUN)!({}, { sessionId: "original", assistantTurnId: "explicit-after-dispose" });
+    const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+    const messages = await resumed.pollShellCompletions!();
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("recover-pending");
+    expect(await resumed.pollShellCompletions!()).toEqual([]);
+    const freshStore = (await import("./orchestrator/conversation-transcript-store")).getConversationTranscriptStore(mocks.userDataRoot);
+    expect((await freshStore.readAuditEntries("original")).filter(entry => entry.kind === "background_event")).toHaveLength(1);
+    mocks.handlers.get(IPC.AGUI_CANCEL)!({}, resumed.runId);
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    await mocks.handlers.get(IPC.AGUI_RUN)!({}, { sessionId: "original", assistantTurnId: "second-explicit" });
+    const second = mocks.runCyreneAgent.mock.calls[2][0] as typeof original;
+    expect(await second.pollShellCompletions!()).toEqual([]);
+  });
+
+  it.each(["retired", "wrong-workspace", "superseded"])("does not recover an ineligible durable result: %s", async reason => {
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const { shellCompletionMessage } = await import("./orchestrator/shell-completion-dispatcher");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    const sourceWorkspace = JSON.stringify([reason === "wrong-workspace" ? "old-root" : mocks.userDataRoot, 1]);
+    const message = shellCompletionMessage({ conversationId: "original", sourceRunId: "old-run", sourceWorkspace, snapshot: snapshot("ineligible") });
+    await store.append("original", { kind: "user", id: "old-user", turnId: "old-user", revision: 1, at: 1, payload: { text: "old task" } });
+    await store.append("original", { kind: "assistant", id: "old-answer", runId: "old-run", at: 2, payload: { role: "assistant", content: "started" } });
+    await store.append("original", { kind: "background_event_pending", id: "shell-completed:ineligible", runId: "old-run", at: 3,
+      payload: { jobId: "ineligible", sourceWorkspace, message } });
+    if (reason === "retired") await store.append("original", { kind: "background_event_retired", id: "shell-retired:ineligible", at: 4, payload: { jobId: "ineligible", sourceSeq: 3 } });
+    if (reason === "superseded") await store.append("original", { kind: "turn_rewind", id: "rewind-old", at: 4,
+      payload: { anchorUserTurnId: "old-user", disposition: "keep_user", reason: "regenerate" } });
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    const run = await start();
+    expect(await run.pollShellCompletions!()).toEqual([]);
+    const audit = await store.readAuditEntries("original");
+    expect(audit.some(entry => entry.kind === "background_event")).toBe(false);
+    expect(audit.some(entry => entry.kind === "background_event_retired")).toBe(true);
+  });
+
+  it("idle completion wakes the original conversation and provides durable result context without a fake user turn", async () => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    original.onShellJobComplete!(snapshot());
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+    expect(resumed.conversationId).toBe("original");
+    expect(resumed.transcriptSink).toBeDefined();
+    expect(resumed.harnessInteractiveTools).toBe(false);
+    expect(resumed.allowPermissionPrompt).toBe(false);
+    expect(resumed.requestUserClarification).toBeUndefined();
+    expect(resumed.permissionMode).not.toBe("allow_all");
+    expect(resumed.messages).toEqual(expect.arrayContaining([expect.objectContaining({ visibility: "internal", content: expect.stringContaining('"exitCode":7') })]));
+    expect(await resumed.pollShellCompletions!()).toEqual([]);
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const entries = (await getConversationTranscriptStore(mocks.userDataRoot).read("original")).entries;
+    expect(entries.filter(entry => entry.kind === "background_event")).toHaveLength(1);
+    expect(entries.filter(entry => entry.kind === "user")).toHaveLength(0);
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+  });
+
+  it.each(["foreground", "background"].flatMap(mode =>
+    ["runtime_error", "stream_error", "cancelled", "retirement_failure", "success"].map(outcome => ({ mode, outcome })),
+  ))("settles $mode Shell consumption safely: $outcome", async ({ mode, outcome }) => {
+    const background = mode === "background";
+    if (!background) { mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true; }
+    const original = await start();
+    if (background) {
+      await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+      mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    }
+    original.onShellJobComplete!(snapshot("foreground-A"));
+    if (background) await expect.poll(() => mocks.runCyreneAgent.mock.calls.length, { timeout: 5000 }).toBe(2);
+    const consumer = (background ? mocks.runCyreneAgent.mock.calls[1][0] : original) as typeof original;
+    if (!background) expect(await consumer.pollShellCompletions!()).toHaveLength(1);
+    expect(await consumer.pollShellCompletions!()).toEqual([]);
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    const append = store.append.bind(store);
+    let failRetirement = outcome === "retirement_failure";
+    const spy = vi.spyOn(store, "append").mockImplementation(async (...args) => {
+      if (failRetirement && args[1].kind === "background_event_retired") throw new Error("RETIRE_FAILED");
+      return append(...args);
+    });
+    try {
+      if (outcome === "stream_error") mocks.failRuns.get(consumer.runId!)!();
+      else if (outcome === "cancelled") mocks.handlers.get(IPC.AGUI_CANCEL)!({}, consumer.runId);
+      else mocks.finishRuns.get(consumer.runId!)!({ status: outcome === "success" ? "success" : "runtime_error", reason: "fixture" });
+      await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+      // 本轮失败不使 Shell 结果失效，尚未变更工作区时必须仍可供用户续问。
+      expect(JSON.stringify((await new ConversationJournalService({ store }).buildModelContext("original")).messages)).toContain("foreground-A");
+      expect((await store.readAuditEntries("original")).filter(entry => entry.kind === "background_event_retired")).toHaveLength(0);
+      if (failRetirement) {
+        await expect(bridge.prepareBackgroundSessionMutation("original")).rejects.toThrow("RETIRE_FAILED");
+        failRetirement = false;
+      }
+      const finishes = await Promise.all([bridge.prepareBackgroundSessionMutation("original"), bridge.prepareBackgroundSessionMutation("original")]);
+      mocks.getSession.mockImplementation((id: string) => ({ id, mode: "code", messages: [],
+        workspaceBinding: { workspaceRoot: path.join(mocks.userDataRoot, "B"), displayName: "B", boundAt: 2 } }));
+      for (const finish of finishes) finish(true);
+      const context = await new ConversationJournalService({ store }).buildModelContext("original");
+      expect(JSON.stringify(context.messages).includes("foreground-A")).toBe(outcome === "success");
+      const audit = await store.readAuditEntries("original");
+      expect(audit.filter(entry => entry.kind === "background_event")).toHaveLength(1);
+      expect(audit.filter(entry => entry.kind === "background_event_retired")).toHaveLength(outcome === "success" ? 0 : 1);
+      expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(background ? 2 : 1);
+    } finally { failRetirement = false; spy.mockRestore(); }
+  });
+
+  it.each(["runtime_error", "stream_error"])("keeps failed %s output for a successful same-workspace retry", async failure => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true;
+    original.onShellJobComplete!(snapshot("retained-A"));
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+    if (failure === "stream_error") mocks.failRuns.get(resumed.runId!)!();
+    else mocks.finishRuns.get(resumed.runId!)!({ status: "runtime_error", reason: "model failed" });
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.skipDefaultRunFinished = false; mocks.neverComplete = false;
+    mocks.runFinishedResult = { status: "success", reason: "done" };
+    await mocks.handlers.get(IPC.AGUI_RUN)!({}, { sessionId: "original", assistantTurnId: "retry-turn",
+      currentUser: { turnId: "retry-user", text: "continue", visibleContent: "continue" } });
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    const retry = mocks.runCyreneAgent.mock.calls[2][0] as typeof original;
+    expect(JSON.stringify(retry.messages)).toContain("retained-A");
+    expect(await retry.pollShellCompletions!()).toEqual([]);
+    const finish = await bridge.prepareBackgroundSessionMutation("original");
+    finish(true);
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    expect((await getConversationTranscriptStore(mocks.userDataRoot).readAuditEntries("original"))
+      .filter(entry => entry.kind === "background_event_retired")).toHaveLength(0);
+  });
+
+  it("retires retained failed output when its source branch is rewound before retry", async () => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    await store.append("original", { kind: "user", id: "source-user", turnId: "source-user", revision: 1, at: 1, payload: { text: "old task" } });
+    await store.append("original", { kind: "assistant", id: "source-assistant", runId: original.runId, at: 2, payload: { role: "assistant", content: "launched shell" } });
+    mocks.runFinishedResult = { status: "runtime_error", reason: "model failed" };
+    original.onShellJobComplete!(snapshot("rewound-retained"));
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    expect((await store.readAuditEntries("original")).filter(entry => entry.kind === "background_event_retired")).toHaveLength(0);
+    await store.append("original", { kind: "turn_rewind", id: "rewind-source", at: 3,
+      payload: { anchorUserTurnId: "source-user", disposition: "keep_user", reason: "regenerate" } });
+    mocks.runFinishedResult = { status: "success", reason: "done" };
+    await mocks.handlers.get(IPC.AGUI_RUN)!({}, { sessionId: "original", assistantTurnId: "retry-turn",
+      currentUser: { turnId: "retry-user", text: "continue", visibleContent: "continue" } });
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    expect(JSON.stringify(mocks.runCyreneAgent.mock.calls[2][0].messages)).not.toContain("rewound-retained");
+    expect((await store.readAuditEntries("original")).filter(entry => entry.kind === "background_event_retired")).toHaveLength(1);
+  });
+
+  it.each(["runtime_error", "stream_error"])("retires acknowledged output after %s before rebinding", async failure => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.skipDefaultRunFinished = failure === "stream_error";
+    mocks.neverComplete = failure === "stream_error";
+    mocks.runFinishedResult = { status: "runtime_error", reason: "MODEL_FAILED" };
+    original.onShellJobComplete!(snapshot("failed-A"));
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+    if (failure === "stream_error") mocks.failRuns.get(resumed.runId!)!();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    const finish = await bridge.prepareBackgroundSessionMutation("original");
+    mocks.getSession.mockImplementation((id: string) => ({ id, mode: "code", messages: [],
+      workspaceBinding: { workspaceRoot: path.join(mocks.userDataRoot, "B"), displayName: "B", boundAt: 2 } }));
+    finish(true);
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    const context = await new ConversationJournalService({ store }).buildModelContext("original");
+    expect(JSON.stringify(context.messages)).not.toContain("failed-A");
+    expect((await store.readAuditEntries("original")).filter(entry => entry.kind === "background_event")).toHaveLength(1);
+    expect((await store.readAuditEntries("original")).filter(entry => entry.kind === "background_event_retired")).toHaveLength(1);
+  });
+
+  it.each(["code", "work", "learn"])("retires a persisted completion when the %s workspace is cleared", async mode => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.getSession.mockImplementation((id: string) => ({ id, mode, messages: [] }));
+    original.onShellJobComplete!(snapshot());
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    await expect.poll(async () => (await getConversationTranscriptStore(mocks.userDataRoot).read("original")).entries.filter(entry => entry.kind === "background_event_pending").length).toBe(1);
+    // 等待超过重试间隔，确保没有继续读取会话或遗留待投递事件。
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const reads = mocks.getSession.mock.calls.length;
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    expect(mocks.getSession.mock.calls.length).toBe(reads);
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+    expect(await original.pollShellCompletions!()).toEqual([]);
+    expect((await getConversationTranscriptStore(mocks.userDataRoot).read("original")).entries[0].kind).toBe("background_event_pending");
+  });
+
+  it.each(["code", "work", "learn"])("keeps a %s completion durable without waking a rebound workspace", async mode => {
+    mocks.getSession.mockImplementation((id: string) => ({ id, mode, messages: [],
+      workspaceBinding: { workspaceRoot: mocks.userDataRoot, displayName: "A", boundAt: 1 } }));
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.getSession.mockImplementation((id: string) => ({ id, mode, messages: [],
+      workspaceBinding: { workspaceRoot: path.join(mocks.userDataRoot, "B"), displayName: "B", boundAt: 2 } }));
+    original.onShellJobComplete!(snapshot());
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    await expect.poll(async () => (await getConversationTranscriptStore(mocks.userDataRoot).read("original")).entries.filter(entry => entry.kind === "background_event_pending").length).toBe(1);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+    await bridge.disposeShellCompletionDispatch();
+    const entries = (await getConversationTranscriptStore(mocks.userDataRoot).read("original")).entries;
+    expect(entries.filter(entry => entry.kind === "background_event_pending")).toHaveLength(1);
+    expect(JSON.stringify(entries)).toContain("sourceWorkspace");
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["code", "work", "learn"])("does not replay retired A output when a %s completion in B wakes the conversation", async mode => {
+    mocks.getSession.mockImplementation((id: string) => ({ id, mode, messages: [],
+      workspaceBinding: { workspaceRoot: mocks.userDataRoot, displayName: "A", boundAt: 1 } }));
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.getSession.mockImplementation((id: string) => ({ id, mode, messages: [],
+      workspaceBinding: { workspaceRoot: path.join(mocks.userDataRoot, "B"), displayName: "B", boundAt: 2 } }));
+    original.onShellJobComplete!(snapshot("job-A"));
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    await expect.poll(async () => (await store.read("original")).entries.some(entry => entry.kind === "background_event_pending")).toBe(true);
+    await expect.poll(() => original.pollShellCompletions!()).toEqual([]);
+    await mocks.handlers.get(IPC.AGUI_RUN)!({}, { sessionId: "original", assistantTurnId: "initial-B" });
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    const inB = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+    inB.onShellJobComplete!(snapshot("job-B"));
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(3);
+    const resumed = mocks.runCyreneAgent.mock.calls[2][0] as typeof original;
+    expect(JSON.stringify(resumed.messages)).toContain("job-B");
+    expect(JSON.stringify(resumed.messages)).not.toContain("job-A");
+    const entries = await store.readAuditEntries("original");
+    expect(entries.filter(entry => entry.kind === "background_event_pending")).toHaveLength(2);
+    expect(entries).toContainEqual(expect.objectContaining({ kind: "background_event_retired", payload: { jobId: "job-A",
+      sourceSeq: entries.find(entry => entry.kind === "background_event_pending" && entry.payload.jobId === "job-A")!.seq } }));
+    expect(entries).toContainEqual(expect.objectContaining({ kind: "background_event_pending", payload: expect.objectContaining({
+      jobId: "job-A", sourceWorkspace: JSON.stringify([mocks.userDataRoot, 1]),
+    }) }));
+  });
+
+  it.each(["code", "work", "learn"])("aborts and settles an in-flight %s continuation before a workspace mutation", async mode => {
+    mocks.getSession.mockImplementation((id: string) => ({ id, mode, messages: [],
+      workspaceBinding: { workspaceRoot: mocks.userDataRoot, displayName: "A", boundAt: 1 } }));
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    original.onShellJobComplete!(snapshot());
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    mocks.beforeAbortSettlement = async () => {
+      await gate;
+      await resumed.transcriptSink!.closeInterruption({ reason: "user_cancel", runSession: null });
+    };
+    let settled = false;
+    let changing: Promise<void> | undefined;
+    try {
+      changing = bridge.cancelBackgroundConversationRun("original").then(() => { settled = true; });
+      expect(resumed.signal!.aborted).toBe(true);
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(settled).toBe(false);
+      expect(bridge.__getSessionActiveRunForTest("original")).toBe(resumed.runId);
+    } finally { release(); await changing; }
+    expect(bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    const { getConversationDatabase } = await import("./storage/conversation-database-client");
+    const runs = await getConversationDatabase(mocks.userDataRoot).call<Array<{ runId: string; status: string }>>("runs.all");
+    expect(runs).toContainEqual(expect.objectContaining({ runId: resumed.runId, status: "cancelled" }));
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    expect((await getConversationTranscriptStore(mocks.userDataRoot).read("original")).entries)
+      .toContainEqual(expect.objectContaining({ kind: "interruption", runId: resumed.runId }));
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const context = await new ConversationJournalService({ store: getConversationTranscriptStore(mocks.userDataRoot) }).buildModelContext("original");
+    expect(JSON.stringify(context.messages)).not.toContain("job-smoke");
+    const count = mocks.runCyreneAgent.mock.calls.length;
+    original.onShellJobComplete!(snapshot("late-old-workspace"));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(count);
+  });
+
+  it("keeps retired prepared events out of live polling after mutation rollback", async () => {
+    let builds = 0;
+    let preparing = false;
+    bridge.registerAgUiIpc(async input => {
+      if (input.modelContext && ++builds === 1) {
+        preparing = true;
+        await new Promise<void>(resolve => input.signal!.addEventListener("abort", () => resolve(), { once: true }));
+        throw new Error("PREFLIGHT_CANCELLED");
+      }
+      return { options: { settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+        messages: input.modelContext?.messages ?? [], toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" }, latestUserText: "fixture" };
+    }, async () => {}, () => null);
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    original.onShellJobComplete!(snapshot("retired-prepared"));
+    await expect.poll(() => preparing).toBe(true);
+    const finish = await bridge.prepareBackgroundSessionMutation("original");
+    finish(false);
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    expect(builds).toBe(1);
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+    expect(await original.pollShellCompletions!()).toEqual([]);
+    original.onShellJobComplete!(snapshot("fresh-after-rollback"));
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+    expect(JSON.stringify(resumed.messages)).toContain("fresh-after-rollback");
+    expect(JSON.stringify(resumed.messages)).not.toContain("retired-prepared");
+    expect(await resumed.pollShellCompletions!()).toEqual([]);
+  });
+
+  it("bounds mutation settlement waits without releasing an unresponsive run", async () => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = false;
+    original.onShellJobComplete!(snapshot("blocked-run"));
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+    bridge.__setCompletionSettlementTimeoutForTest(20);
+    try {
+      await expect(bridge.prepareBackgroundSessionMutation("original")).rejects.toThrow("SHELL_COMPLETION_SETTLEMENT_TIMEOUT");
+      expect(bridge.__getSessionActiveRunForTest("original")).toBe(resumed.runId);
+    } finally {
+      mocks.finishRuns.get(resumed.runId!)!({ status: "cancelled", reason: "fixture" });
+      await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+      bridge.__setCompletionSettlementTimeoutForTest(5000);
+    }
+    const finish = await bridge.prepareBackgroundSessionMutation("original");
+    finish(false);
+  });
+
+  it("retries failed retirement after the cancelled run guard is released", async () => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    original.onShellJobComplete!(snapshot("retry-retirement"));
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    const append = store.append.bind(store);
+    let fail = true;
+    const spy = vi.spyOn(store, "append").mockImplementation(async (...args) => {
+      if (args[1].kind === "background_event_retired" && fail) { throw new Error("RETIRE_FAILED"); }
+      return append(...args);
+    });
+    try {
+      await expect(bridge.cancelBackgroundConversationRun("original")).rejects.toThrow("RETIRE_FAILED");
+      expect(bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+      fail = false;
+      await bridge.cancelBackgroundConversationRun("original");
+      const context = await new ConversationJournalService({ store }).buildModelContext("original");
+      expect(JSON.stringify(context.messages)).not.toContain("retry-retirement");
+      expect((await store.readAuditEntries("original")).filter(entry => entry.kind === "background_event_retired")).toHaveLength(1);
+    } finally { spy.mockRestore(); }
+  });
+
+  it.each(["keep_user", "replace_user"] as const)("retires a late completion from a branch removed by %s", async disposition => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    await store.append("original", { kind: "user", id: "source-user", turnId: "source-user", revision: 1, at: 1, payload: { text: "old task" } });
+    await store.append("original", { kind: "assistant", id: "source-assistant", runId: original.runId, at: 2, payload: { role: "assistant", content: "launched shell" } });
+    await store.append("original", { kind: "turn_rewind", id: "replace-old", at: 3,
+      ...(disposition === "replace_user" ? { turnId: "source-user", revision: 2 } : {}),
+      payload: { anchorUserTurnId: "source-user", disposition, reason: disposition === "keep_user" ? "regenerate" : "edit", replacementUser: { text: "new task" } } });
+    original.onShellJobComplete!(snapshot("superseded-job"));
+    await expect.poll(async () => (await store.readAuditEntries("original")).some(entry => entry.kind === "background_event_retired")).toBe(true);
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+    expect(await original.pollShellCompletions!()).toEqual([]);
+    const context = await new ConversationJournalService({ store }).buildModelContext("original");
+    expect(JSON.stringify(context.messages)).not.toContain("superseded-job");
+  });
+
+  it.each(["keep_user", "replace_user"] as const)("retires the later Shell segment after a partial same-run rewind by %s", async disposition => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    await store.append("original", { kind: "user", id: "first-user", turnId: "first-user", revision: 1, at: 0, payload: { text: "first segment" } });
+    await store.append("original", { kind: "assistant", id: "first-assistant", runId: original.runId, at: 0, payload: { role: "assistant", content: "surviving segment", toolCalls: [{ id: "first-shell", name: "run_shell", arguments: "{}" }] } });
+    await store.append("original", { kind: "user", id: "source-user", turnId: "source-user", revision: 1, at: 1, payload: { text: "old task" } });
+    await store.append("original", { kind: "assistant", id: "source-assistant", runId: original.runId, at: 2, payload: { role: "assistant", content: "launched shell", toolCalls: [{ id: "later-shell", name: "run_shell", arguments: "{}" }] } });
+    await store.append("original", { kind: "turn_rewind", id: "replace-old", at: 3,
+      ...(disposition === "replace_user" ? { turnId: "source-user", revision: 2 } : {}),
+      payload: { anchorUserTurnId: "source-user", disposition, reason: disposition === "keep_user" ? "regenerate" : "edit", replacementUser: { text: "new task" } } });
+    original.onShellJobComplete!(snapshot("superseded-job"), "later-shell");
+    await expect.poll(async () => (await store.readAuditEntries("original")).some(entry => entry.kind === "background_event_retired")).toBe(true);
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+    expect(await original.pollShellCompletions!()).toEqual([]);
+    const context = await new ConversationJournalService({ store }).buildModelContext("original");
+    expect(JSON.stringify(context.messages)).not.toContain("superseded-job");
+    expect(JSON.stringify(context.messages)).toContain("surviving segment");
+    original.onShellJobComplete!(snapshot("surviving-job"), "first-shell");
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+  });
+
+  it("a workspace mutation does not cancel foreground work or another conversation", async () => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    original.onShellJobComplete!(snapshot());
+    await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+    const background = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+    await mocks.handlers.get(IPC.AGUI_RUN)!({}, { sessionId: "other", assistantTurnId: "foreground-other" });
+    const foreground = mocks.runCyreneAgent.mock.calls[2][0] as typeof original;
+    try {
+      await bridge.cancelBackgroundConversationRun("other");
+      expect(background.signal!.aborted).toBe(false);
+      expect(foreground.signal!.aborted).toBe(false);
+    } finally {
+      mocks.handlers.get(IPC.AGUI_CANCEL)!({}, foreground.runId);
+      await expect.poll(() => bridge.__getSessionActiveRunForTest("other")).toBeUndefined();
+    }
+  });
+
+  it("rejects a workspace rebound during background option preparation", async () => {
+    bridge.registerAgUiIpc(async input => {
+      if (input.modelContext) mocks.getSession.mockImplementation((id: string) => ({ id, mode: "code", messages: [],
+        workspaceBinding: { workspaceRoot: path.join(mocks.userDataRoot, "B"), displayName: "B", boundAt: 2 } }));
+      return { options: { settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+        messages: input.modelContext?.messages ?? [], toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" }, latestUserText: "fixture" };
+    }, async () => {}, () => null);
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    original.onShellJobComplete!(snapshot());
+    await expect.poll(() => mocks.getSession("original").workspaceBinding.boundAt).toBe(2);
+    await bridge.disposeShellCompletionDispatch();
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+    expect(bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+  });
+
+  it.each(["context", "options", "sink"])("retries a transient %s preparation failure without losing or duplicating the event", async stage => {
+    if (stage === "options") {
+      let fail = true;
+      bridge.registerAgUiIpc(async input => {
+        if (input.modelContext && fail) { fail = false; throw new Error("TRANSIENT_OPTIONS"); }
+        return { options: { settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+          messages: input.modelContext?.messages ?? [], toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" }, latestUserText: "fixture" };
+      }, async () => {}, () => null);
+    }
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const method = stage === "context" ? "buildModelContext" : "createRunSink";
+    const failure = vi.spyOn(ConversationJournalService.prototype, method);
+    if (stage !== "options") failure.mockImplementationOnce(() => { throw new Error("TRANSIENT_PREPARATION"); });
+    let replySaved: Promise<string> | undefined;
+    mocks.runCyreneAgent.mockImplementation(options => {
+      replySaved = options.transcriptSink.appendAssistant({ message: { role: "assistant", content: "模拟模型已处理任务结果" } });
+    });
+    try {
+      original.onShellJobComplete!(snapshot());
+      await expect.poll(() => mocks.runCyreneAgent.mock.calls.length, { timeout: 4000 }).toBe(2);
+      const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+      expect(JSON.stringify(resumed.messages)).toContain("job-smoke");
+      await replySaved;
+      const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+      const entries = (await getConversationTranscriptStore(mocks.userDataRoot).read("original")).entries;
+      expect(entries.filter(entry => entry.kind === "background_event")).toHaveLength(1);
+      expect(entries.filter(entry => entry.kind === "assistant")).toEqual([
+        expect.objectContaining({ runId: resumed.runId, payload: expect.objectContaining({ content: "模拟模型已处理任务结果" }) }),
+      ]);
+      expect(await resumed.pollShellCompletions!()).toEqual([]);
+      await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    } finally { failure.mockRestore(); }
+  });
+
+  it.each([false, true])("retries failed previous disposal and preserves its pending result (reregister=%s)", async reregister => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    const append = store.append.bind(store);
+    let fail = true;
+    const spy = vi.spyOn(store, "append").mockImplementation(async (...args) => {
+      if (fail && args[1].kind === "background_event_pending") throw new Error("TRANSIENT_DISPOSE_SAVE");
+      return append(...args);
+    });
+    original.onShellJobComplete!(snapshot("old-pending"));
+    bridge.registerAgUiIpc(async input => ({ options: { settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+      messages: input.modelContext?.messages ?? [], toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" }, latestUserText: "fixture" }), async () => {}, () => null);
+    try {
+      await expect(mocks.handlers.get(IPC.AGUI_RUN)!({}, { sessionId: "original", assistantTurnId: "failed-retry" })).rejects.toThrow();
+      expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+      fail = false;
+      if (reregister) {
+        // 再次注册接管失败的前代，同时保存新队列里的迟到结果。
+        original.onShellJobComplete!(snapshot("second-pending"));
+        bridge.registerAgUiIpc(async input => ({ options: { settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+          messages: input.modelContext?.messages ?? [], toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" }, latestUserText: "fixture" }), async () => {}, () => null);
+      }
+      mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+      await mocks.handlers.get(IPC.AGUI_RUN)!({}, { sessionId: "original", assistantTurnId: "recovered-retry" });
+      const recovered = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+      expect(await recovered.pollShellCompletions!()).toHaveLength(reregister ? 2 : 1);
+      expect(await recovered.pollShellCompletions!()).toEqual([]);
+      const audit = await store.readAuditEntries("original");
+      expect(audit.filter(entry => entry.kind === "background_event_pending")).toHaveLength(reregister ? 2 : 1);
+      expect(audit.filter(entry => entry.kind === "background_event")).toHaveLength(reregister ? 2 : 1);
+    } finally { fail = false; spy.mockRestore(); }
+  });
+
+  it("waits for the previous dispatcher write before running a newly registered bridge", async () => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const store = getConversationTranscriptStore(mocks.userDataRoot);
+    const append = store.append.bind(store);
+    let release!: () => void;
+    const delayed = vi.spyOn(store, "append").mockImplementationOnce(async (...args) => {
+      await new Promise<void>(resolve => { release = resolve; });
+      return append(...args);
+    });
+    original.onShellJobComplete!(snapshot());
+    await expect.poll(() => typeof release).toBe("function");
+    const build = vi.fn(async () => ({ options: {
+      settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+      messages: [], toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL",
+    }, latestUserText: "fixture" }));
+    bridge.registerAgUiIpc(build, async () => {}, () => null);
+    const next = mocks.handlers.get(IPC.AGUI_RUN)!({ sender: { isDestroyed: () => false, send: vi.fn() } },
+      { sessionId: "original", assistantTurnId: "after-registration" });
+    try {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(build).not.toHaveBeenCalled();
+    } finally { release(); await next; delayed.mockRestore(); }
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(2);
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+  });
+
+  it("busy completion is injected once and never starts a concurrent run", async () => {
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    const original = await start();
+    original.onShellJobComplete!(snapshot());
+    const messages = await original.pollShellCompletions!();
+    expect(messages).toHaveLength(1);
+    expect(await original.pollShellCompletions!()).toEqual([]);
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+    mocks.handlers.get(IPC.AGUI_CANCEL)!({}, original.runId);
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+  });
+
+  it("smoke: local process terminal -> log flush -> inbox -> SQLite transcript -> idle agent continuation", async () => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    const { EventEmitter } = await import("node:events");
+    const { PassThrough } = await import("node:stream");
+    const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() });
+    const spawn = vi.fn(() => child);
+    vi.doMock("child_process", () => ({ spawn }));
+    const manager = await import("./orchestrator/tools/builtin-tools/shell-job-manager");
+    try {
+      const job = await manager.startShellJob({ command: "simulated-command", shell: "cmd", onComplete: original.onShellJobComplete,
+        spec: { command: "never-executed", args: [], env: {}, windowsVerbatimArguments: false, ranViaSandbox: false } });
+      expect(spawn).toHaveBeenCalledTimes(1);
+      child.stdout.emit("data", Buffer.from("smoke-result"));
+      child.emit("close", 0);
+      await expect.poll(() => mocks.runCyreneAgent.mock.calls.length).toBe(2);
+      const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+      expect(JSON.stringify(resumed.messages)).toContain("smoke-result");
+      expect(JSON.stringify(resumed.messages)).toContain(job.jobId);
+      await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+      const { getConversationDatabase } = await import("./storage/conversation-database-client");
+      expect(await getConversationDatabase(mocks.userDataRoot).call("shellJobs.get", job.jobId)).toMatchObject({ status: "exited", exitCode: 0 });
+    } finally { await manager.disposeAllShellJobs(); }
+  });
+
+  it("cancellation, deleted conversations and shutdown cannot restart the agent", async () => {
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    const original = await start();
+    mocks.handlers.get(IPC.AGUI_CANCEL)!({}, original.runId);
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    original.onShellJobComplete!(snapshot());
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    await expect.poll(async () => (await getConversationTranscriptStore(mocks.userDataRoot).read("original")).entries.length).toBe(1);
+    mocks.getSession.mockReturnValue(null);
+    original.onShellJobComplete!(snapshot("deleted-job"));
+    await bridge.disposeShellCompletionDispatch();
+    original.onShellJobComplete!(snapshot("after-shutdown"));
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("shutdown while preparing an idle continuation never starts its model run", async () => {
+    let releaseBuild!: () => void;
+    let backgroundBuilding = false;
+    bridge.registerAgUiIpc(async input => {
+      if (input.modelContext) {
+        backgroundBuilding = true;
+        await new Promise<void>(resolve => { releaseBuild = resolve; });
+      }
+      return { options: { settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+        messages: input.modelContext?.messages ?? [], toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" }, latestUserText: "fixture" };
+    }, async () => {}, () => null);
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    original.onShellJobComplete!(snapshot());
+    await expect.poll(() => backgroundBuilding).toBe(true);
+    const stopping = bridge.disposeShellCompletionDispatch();
+    releaseBuild();
+    await stopping;
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+    expect(bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+  });
+
+  it.each(["rebind", "delete", "shutdown"])("cancels background preflight before waiting for %s settlement", async action => {
+    let preparationSignal: AbortSignal | undefined;
+    let release: (() => void) | undefined;
+    let entered!: () => void;
+    const preparationEntered = new Promise<void>(resolve => { entered = resolve; });
+    bridge.registerAgUiIpc(async input => {
+      if (input.modelContext) {
+        preparationSignal = input.signal;
+        await new Promise<void>(resolve => { release = resolve; entered(); input.signal?.addEventListener("abort", () => resolve(), { once: true }); });
+        throw new Error("PREFLIGHT_ABORTED");
+      }
+      return { options: { settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+        messages: [], toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" }, latestUserText: "fixture" };
+    }, async () => {}, () => null);
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    original.onShellJobComplete!(snapshot());
+    let stopping: Promise<unknown> | undefined;
+    try {
+      // 等待明确的准备入口，不把 CI 的数据库调度耗时当成取消失败。
+      await preparationEntered;
+      stopping = action === "shutdown" ? bridge.disposeShellCompletionDispatch()
+        : action === "delete" ? bridge.prepareBackgroundSessionMutation("original") : bridge.cancelBackgroundConversationRun("original");
+      expect(preparationSignal?.aborted).toBe(true);
+      await stopping;
+      expect(bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+      expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+    } finally { release?.(); await stopping; }
+  }, 10_000);
+
+  it("backs off persistent background preparation failures instead of immediately admitting retries", async () => {
+    let attempts = 0;
+    bridge.registerAgUiIpc(async input => {
+      if (input.modelContext) { attempts++; throw new Error("INVALID_MODEL_URL"); }
+      return { options: { settings: { provider: "test", baseUrl: "", model: "fake", apiKey: "" },
+        messages: [], toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" }, latestUserText: "fixture" };
+    }, async () => {}, () => null);
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    original.onShellJobComplete!(snapshot());
+    await expect.poll(() => attempts).toBe(1);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(attempts).toBe(1);
+    await expect.poll(() => attempts, { timeout: 2500 }).toBe(2);
+    await bridge.disposeShellCompletionDispatch();
+    expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+    const { getConversationDatabase } = await import("./storage/conversation-database-client");
+    const runs = await getConversationDatabase(mocks.userDataRoot).call<Array<{ status: string }>>("runs.all");
+    expect(runs.filter(run => run.status === "failed")).toHaveLength(2);
+  });
+
+  it.each(["abort", "cleanup"])("shutdown waits for %s settlement even when dispatcher disposal fails", async phase => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      let cleanupStarted = false;
+      mocks.resetPendingAdjustByRun.mockImplementation(async () => {
+        cleanupStarted = true;
+        if (phase === "cleanup") await gate;
+        return { ok: true, reset: 0 };
+      });
+      original.onShellJobComplete!(snapshot());
+      // 隔离数据库准备可能超过默认的一秒轮询预算；仍要求续轮真正启动。
+      await expect.poll(() => mocks.runCyreneAgent.mock.calls.length, { timeout: 5000 }).toBe(2);
+      const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+      mocks.beforeAbortSettlement = async () => {
+        if (phase === "abort") await gate;
+        await resumed.transcriptSink!.closeInterruption({ reason: "user_cancel", runSession: null });
+      };
+      if (phase === "cleanup") {
+        mocks.handlers.get(IPC.AGUI_CANCEL)!({}, resumed.runId);
+        await expect.poll(() => cleanupStarted).toBe(true);
+      }
+      const { ShellCompletionDispatcher } = await import("./orchestrator/shell-completion-dispatcher");
+      const dispose = ShellCompletionDispatcher.prototype.dispose;
+      const failure = new Error("FINAL_TRANSCRIPT_APPEND_FAILED");
+      const spy = vi.spyOn(ShellCompletionDispatcher.prototype, "dispose").mockImplementationOnce(async function () {
+        await dispose.call(this);
+        throw failure;
+      });
+      let finished = false;
+      const stopping = bridge.disposeShellCompletionDispatch().then(
+        () => { finished = true; return undefined; },
+        error => { finished = true; return error; },
+      );
+      try {
+        await new Promise(resolve => setTimeout(resolve, 30));
+        expect(finished).toBe(false);
+        expect(bridge.__getSessionActiveRunForTest("original")).toBeDefined();
+      } finally {
+        release();
+        await stopping;
+        await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+        spy.mockRestore();
+      }
+      expect(await stopping).toBe(failure);
+      await closeConversationDatabases();
+      const { getConversationDatabase } = await import("./storage/conversation-database-client");
+      const runs = await getConversationDatabase(mocks.userDataRoot).call<Array<{ runId: string; status: string }>>("runs.all");
+      expect(runs).toContainEqual(expect.objectContaining({ runId: resumed.runId, status: "cancelled" }));
+      const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+      expect((await getConversationTranscriptStore(mocks.userDataRoot).read("original")).entries)
+        .toContainEqual(expect.objectContaining({ kind: "interruption", runId: resumed.runId }));
+    } finally {
+      // 启动或前置断言失败时也释放闸门，避免 afterEach 等待自身测试阻塞。
+      release();
+    }
+  });
+
+  it.each(["abort", "cleanup"])("shutdown waits for background %s settlement before persistence can close", async phase => {
+    const original = await start();
+    await expect.poll(() => bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+    mocks.skipDefaultRunFinished = true; mocks.neverComplete = true; mocks.completeOnAbort = true;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      let cleanupStarted = false;
+      mocks.resetPendingAdjustByRun.mockImplementation(async () => {
+        cleanupStarted = true;
+        if (phase === "cleanup") await gate;
+        return { ok: true, reset: 0 };
+      });
+      original.onShellJobComplete!(snapshot());
+      // 隔离数据库准备可能超过默认的一秒轮询预算；仍要求续轮真正启动。
+      await expect.poll(() => mocks.runCyreneAgent.mock.calls.length, { timeout: 5000 }).toBe(2);
+      const resumed = mocks.runCyreneAgent.mock.calls[1][0] as typeof original;
+      mocks.beforeAbortSettlement = async () => {
+        if (phase === "abort") await gate;
+        await resumed.transcriptSink!.closeInterruption({ reason: "user_cancel", runSession: null });
+      };
+      if (phase === "cleanup") {
+        mocks.handlers.get(IPC.AGUI_CANCEL)!({}, resumed.runId);
+        await expect.poll(() => cleanupStarted).toBe(true);
+      }
+      let disposed = false;
+      const stopping = bridge.disposeShellCompletionDispatch().then(() => { disposed = true; });
+      try {
+        await new Promise(resolve => setTimeout(resolve, 30));
+        expect(disposed).toBe(false);
+        expect(bridge.__getSessionActiveRunForTest("original")).toBeDefined();
+      } finally { release(); await stopping; }
+      expect(bridge.__getSessionActiveRunForTest("original")).toBeUndefined();
+      await closeConversationDatabases();
+      const { getConversationDatabase } = await import("./storage/conversation-database-client");
+      const runs = await getConversationDatabase(mocks.userDataRoot).call<Array<{ runId: string; status: string }>>("runs.all");
+      expect(runs).toContainEqual(expect.objectContaining({ runId: resumed.runId, status: "cancelled" }));
+      const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+      expect((await getConversationTranscriptStore(mocks.userDataRoot).read("original")).entries)
+        .toContainEqual(expect.objectContaining({ kind: "interruption", runId: resumed.runId }));
+      expect(cleanupStarted).toBe(true);
+    } finally {
+      // 启动或前置断言失败时也释放闸门，避免 afterEach 等待自身测试阻塞。
+      release();
+    }
+  });
+});
+
+describe("agui-bridge transcript dispatch", () => {
+  const roots: string[] = [];
+
+  function makeSender() {
+    return { isDestroyed: () => false, send: () => {} };
+  }
+
+  afterEach(async () => {
+  await closeConversationDatabases();
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  async function setupBridge(buildOptions?: (input: unknown) => Promise<unknown>) {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.runCyreneAgent.mockClear();
+    mocks.getSessionRecord.mockReset();
+    mocks.getPendingDispatch.mockReset();
+    mocks.composeSession.mockReset();
+    const seenInputs: unknown[] = [];
+    const bridge = await import("./agui-bridge");
+    bridge.registerAgUiIpc(
+      buildOptions ?? (async (input: unknown) => {
+        seenInputs.push(input);
+        return {
+          options: {
+            settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+            messages: [],
+            timeoutMs: 1000,
+            toolSystemContent: "TOOL",
+            soulSystemBaseContent: "SOUL",
+          },
+          latestUserText: "当前输入",
+        };
+      }),
+      async () => {},
+      () => null,
+    );
+    const runHandler = mocks.handlers.get(IPC.AGUI_RUN);
+    if (!runHandler) throw new Error("AGUI_RUN handler was not registered");
+    return { bridge, runHandler, seenInputs };
+  }
+
+  it.each(["keep_user", "replace_user"] as const)("rejects stale %s before model startup and releases the session guard", async (disposition) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-stale-"));
+    roots.push(root);
+    mocks.userDataRoot = root;
+    const { bridge, runHandler, seenInputs } = await setupBridge();
+    const record = { id: "stale-session", title: "fixture", identityId: null, createdAt: 1, updatedAt: 1, schemaVersion: 2, messageCount: 3, mode: "chat" };
+    mocks.getSessionRecord.mockReturnValue(record);
+    mocks.composeSession.mockImplementation((_record: unknown, messages: unknown[]) => ({ ...record, messages }));
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const { getConversationDatabase } = await import("./storage/conversation-database-client");
+    const store = getConversationTranscriptStore(root);
+    const journal = new ConversationJournalService(store);
+    await journal.appendUser(record.id, { id: "u1", turnId: "u1", text: "old", at: 1 });
+    await journal.createRunSink({ conversationId: record.id, runId: "old", assistantTurnId: "old-answer" })
+      .appendAssistant({ message: { role: "assistant", content: "old answer" }, roundId: "reply" });
+    await journal.createRunSink({ conversationId: record.id, runId: "proactive-intent-1" })
+      .appendAssistant({ message: { role: "assistant", content: "keep proactive" }, roundId: "proactive" });
+    const before = await store.readAuditEntries(record.id);
+    await expect(runHandler({ sender: makeSender() }, {
+      sessionId: record.id, assistantTurnId: "retry-assistant",
+      currentUser: { turnId: "u1", text: "edited", visibleContent: "edited" },
+      transcriptRewind: { anchorUserTurnId: "u1", expectedAssistantMessageId: "old-answer", disposition },
+    })).rejects.toThrow("TRANSCRIPT_REWIND_STALE");
+    expect(await store.readAuditEntries(record.id)).toEqual(before);
+    expect(bridge.__getSessionActiveRunForTest(record.id)).toBeUndefined();
+    expect(await getConversationDatabase(root).call("runs.all")).toEqual([]);
+    expect(seenInputs).toEqual([]);
+    expect(mocks.runCyreneAgent).not.toHaveBeenCalled();
+  });
+
+  it("commits the turn to the transcript and flags transcript context before build options", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-dispatch-"));
+    roots.push(root);
+    mocks.userDataRoot = root;
+    mocks.getSession.mockReturnValue({
+      id: "chat-transcript",
+      mode: "chat",
+      messages: [
+        { id: "m1", role: "user", content: "旧问题", at: 1 },
+        { id: "m2", role: "model", content: "旧回答", at: 2 },
+        { id: "u1", role: "user", content: "当前输入", at: 3 },
+      ],
+    });
+    const dir = path.join(root, "cyrene-chats", "sessions");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "chat-transcript.json"), JSON.stringify({ ...mocks.getSession(), title: "fixture", identityId: null, createdAt: 1, updatedAt: 3, schemaVersion: 1 }));
+    const { runHandler, seenInputs } = await setupBridge();
+    const sender = makeSender();
+
+    await runHandler({ sender }, { assistantTurnId: "fixture-62154",
+      messages: [{ role: "user", content: "当前输入" }],
+      sessionId: "chat-transcript",
+      userTurnId: "u1",
+    });
+
+    // buildOptions 收到主进程刚构建的权威模型上下文；不再有 renderer 回退开关
+    expect(seenInputs[0]).toMatchObject({
+      currentUser: { turnId: "u1", text: "当前输入", visibleContent: "当前输入" },
+      modelContext: { messages: [
+        { role: "user", content: "旧问题" },
+        { role: "assistant", content: "旧回答" },
+        { role: "user", content: "当前输入" },
+      ] },
+    });
+    expect(seenInputs[0]).not.toHaveProperty("messages");
+
+    // 派发前轨迹已落盘：回填边界 + 当前 user
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const entries = (await getConversationTranscriptStore(root).read("chat-transcript")).entries;
+    expect(entries.filter(entry => entry.kind === "user")).toHaveLength(2);
+    expect(entries.some((entry) => entry.kind === "user" && entry.turnId === "u1")).toBe(true);
+    expect(entries.some((entry) => entry.kind === "assistant" && entry.payload.content === "旧回答")).toBe(true);
+    mocks.userDataRoot = "";
+  });
+
+  it("在 append 前先完成 migration 与 pending reconcile，再构建模型上下文", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-order-"));
+    roots.push(root);
+    mocks.userDataRoot = root;
+    const session = { id: "order-session", mode: "chat" as const, messages: [] };
+    const record = {
+      id: "order-session",
+      title: "order",
+      identityId: null,
+      createdAt: 1,
+      updatedAt: 1,
+      schemaVersion: 2,
+      messageCount: 0,
+      mode: "chat" as const,
+    };
+    mocks.getSession.mockReturnValue(session);
+    const { runHandler } = await setupBridge();
+    mocks.getSessionRecord.mockReturnValue(record);
+    const { ConversationSessionMigration } = await import("./orchestrator/conversation-session-migration");
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const order: string[] = [];
+    const migration = vi.spyOn(ConversationSessionMigration.prototype, "ensureConversationMigrated")
+      .mockImplementation(async () => { order.push("migration"); return null; });
+    const reconcile = vi.spyOn(ConversationJournalService.prototype, "reconcilePendingWithdrawals")
+      .mockImplementation(async () => { order.push("reconcile"); });
+    const append = vi.spyOn(ConversationJournalService.prototype, "appendUser")
+      .mockImplementation(async () => { order.push("append"); return { id: "user:v1:u1:r1", kind: "user", seq: 1, at: 1, turnId: "u1", revision: 1, payload: { text: "next" } }; });
+    const context = vi.spyOn(ConversationJournalService.prototype, "buildModelContext")
+      .mockImplementation(async () => {
+        order.push("context");
+        return { conversationId: "order-session", messages: [] } as any;
+      });
+    try {
+      await runHandler({ sender: makeSender() }, { assistantTurnId: "fixture-64943",
+        sessionId: "order-session",
+        currentUser: { turnId: "u1", text: "next", visibleContent: "next" },
+      });
+      expect(order).toEqual(["migration", "reconcile", "append", "context"]);
+    } finally {
+      migration.mockRestore();
+      reconcile.mockRestore();
+      append.mockRestore();
+      context.mockRestore();
+      mocks.userDataRoot = "";
+    }
+  });
+
+  it("keeps callers without userTurnId on supplied messages without transcript context", async () => {
+    mocks.getSession.mockReturnValue({ id: "chat-plain", mode: "chat" });
+    const { runHandler, seenInputs } = await setupBridge();
+    const sender = makeSender();
+
+    await runHandler({ sender }, { assistantTurnId: "fixture-65643",
+      messages: [{ role: "user", content: "channel text" }],
+      sessionId: "chat-plain",
+    });
+
+    // 无 currentUser 的兼容调用不写轨迹，也不把 raw messages 传给 build-options
+    expect(seenInputs[0]).not.toHaveProperty("modelContext");
+    expect(seenInputs[0]).not.toHaveProperty("messages");
+    const onFinishedNotStarted = mocks.runCyreneAgent;
+    expect(onFinishedNotStarted).toHaveBeenCalled();
+    // 轨迹提交端同样不得注入：否则模型回写没有对应 user 的孤立 assistant 条目
+    const sink = (mocks.runCyreneAgent.mock.calls.at(-1)?.[0] as { transcriptSink?: unknown }).transcriptSink;
+    expect(sink).toBeUndefined();
+  });
+
+  it("does not start the model when the transcript write fails", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-fail-"));
+    roots.push(root);
+    mocks.userDataRoot = root;
+    // 旧 userTurnId 指向的消息不存在 → 兼容锚点拒绝（fail-closed）
+    mocks.getSession.mockReturnValue({
+      id: "chat-fail",
+      mode: "chat",
+      messages: [{ id: "m1", role: "user", content: "旧问题", at: 1 }],
+    });
+    const { runHandler, seenInputs } = await setupBridge();
+    const sender = makeSender();
+
+    await expect(runHandler({ sender }, { assistantTurnId: "fixture-66799",
+      sessionId: "chat-fail",
+      userTurnId: "missing-turn",
+    })).rejects.toThrow("TRANSCRIPT_USER_TURN_NOT_FOUND");
+
+    // 模型不得启动：buildOptions 未被调用
+    expect(seenInputs).toHaveLength(0);
+    expect(mocks.runCyreneAgent).not.toHaveBeenCalled();
+    mocks.userDataRoot = "";
+  });
+
+  it("桌面 dispatch 始终使用 journal 上下文，环境变量不能切换 renderer 回退", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-rollback-"));
+    roots.push(root);
+    mocks.userDataRoot = root;
+    mocks.getSession.mockReturnValue({
+      id: "chat-rollback",
+      mode: "chat",
+      messages: [
+        { id: "m1", role: "user", content: "旧问题", at: 1 },
+        { id: "u1", role: "user", content: "当前输入", at: 2 },
+      ],
+    });
+    const { runHandler, seenInputs } = await setupBridge();
+    const sender = makeSender();
+    try {
+      await runHandler({ sender }, { assistantTurnId: "fixture-67677",
+        sessionId: "chat-rollback",
+        currentUser: { turnId: "u1", text: "当前输入", visibleContent: "当前输入" },
+      });
+
+      expect(seenInputs[0]).toMatchObject({ currentUser: { turnId: "u1" }, modelContext: expect.any(Object) });
+      const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+      const entries = (await getConversationTranscriptStore(root).read("chat-rollback")).entries;
+      expect(entries.filter(entry => entry.kind === "user")).toHaveLength(1);
+      expect(entries.some((entry) => entry.kind === "user" && entry.turnId === "u1")).toBe(true);
+    } finally {
+      mocks.userDataRoot = "";
+    }
+  });
+
+  it.each(["chat", "work", "code", "learn"] as const)(
+    "%s 模式忽略 renderer 恶意历史并使用 journal 权威上下文",
+    async (mode) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), `cyrene-bridge-${mode}-`));
+      roots.push(root);
+      mocks.userDataRoot = root;
+      const record = {
+        id: `journal-${mode}`,
+        title: mode,
+        identityId: null,
+        createdAt: 1,
+        updatedAt: 1,
+        schemaVersion: 2,
+        messageCount: 1,
+        mode,
+        ...(mode === "chat" ? {} : {
+          workspaceBinding: { workspaceRoot: root, displayName: "test", boundAt: 1 },
+        }),
+      };
+      mocks.getSessionRecord.mockReturnValue(record);
+      mocks.composeSession.mockImplementation((_record: unknown, messages: unknown[]) => ({
+        ...record,
+        messages,
+      }));
+      const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+      const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+      const journal = new ConversationJournalService(getConversationTranscriptStore(root));
+      await journal.appendUser(`journal-${mode}`, {
+        id: "authoritative-user",
+        turnId: "old-turn",
+        text: "authoritative",
+        at: 1,
+        revision: 1,
+      });
+      const seen: unknown[] = [];
+      const { runHandler } = await setupBridge(async (input: any) => {
+        seen.push(input);
+        return {
+          options: {
+            settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+            messages: input.modelContext.messages,
+            timeoutMs: 1000,
+            toolSystemContent: "TOOL",
+            soulSystemBaseContent: "SOUL",
+          },
+          latestUserText: input.currentUser.text,
+        };
+      });
+      mocks.getSessionRecord.mockReturnValue(record);
+      mocks.composeSession.mockImplementation((_record: unknown, messages: unknown[]) => ({ ...record, messages }));
+      await runHandler({ sender: makeSender() }, { assistantTurnId: "fixture-70411",
+        sessionId: `journal-${mode}`,
+        mode,
+        messages: [{ role: "user", content: "forged" }],
+        currentUser: { turnId: "new-turn", text: "next", visibleContent: "next" },
+      });
+      const options = mocks.runCyreneAgent.mock.calls.at(-1)?.[0] as { messages: Array<{ content: string }> };
+      expect(options.messages.map((message) => message.content)).toEqual(["authoritative", "next"]);
+      expect(seen[0]).not.toHaveProperty("messages");
+      mocks.userDataRoot = "";
+    },
+  );
+
+  it("v2 replace_user 写单行 rewind，模型分支不产生两个 active user", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-rewind-"));
+    roots.push(root);
+    mocks.userDataRoot = root;
+    const record = {
+      id: "rewind-session", title: "rewind", identityId: null, createdAt: 1, updatedAt: 1,
+      schemaVersion: 2, messageCount: 1, mode: "chat" as const,
+    };
+    mocks.getSessionRecord.mockReturnValue(record);
+    mocks.composeSession.mockImplementation((_record: unknown, messages: unknown[]) => ({ ...record, messages }));
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const journal = new ConversationJournalService(getConversationTranscriptStore(root));
+    await journal.appendUser("rewind-session", { id: "u1", turnId: "u1", text: "old", at: 1, revision: 1 });
+    await journal.createRunSink({ conversationId: "rewind-session", runId: "old", assistantTurnId: "old-answer" })
+      .appendAssistant({ message: { role: "assistant", content: "old answer" }, roundId: "reply" });
+    const { runHandler } = await setupBridge(async (input: any) => ({
+      options: {
+        settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+        messages: input.modelContext.messages,
+        timeoutMs: 1000, toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL",
+      },
+      latestUserText: input.currentUser.text,
+    }));
+    mocks.getSessionRecord.mockReturnValue(record);
+    mocks.composeSession.mockImplementation((_record: unknown, messages: unknown[]) => ({ ...record, messages }));
+    await runHandler({ sender: makeSender() }, { assistantTurnId: "fixture-72493",
+      sessionId: "rewind-session",
+      currentUser: { turnId: "u1", text: "edited", visibleContent: "展示编辑" },
+      transcriptRewind: { anchorUserTurnId: "u1", expectedAssistantMessageId: "old-answer", disposition: "replace_user" },
+    });
+    const transcript = await getConversationTranscriptStore(root).read("rewind-session");
+    expect(transcript.entries.filter((entry) => entry.kind === "user")).toHaveLength(1);
+    expect(transcript.entries.filter((entry) => entry.kind === "turn_rewind")).toHaveLength(1);
+    const model = await journal.buildModelContext("rewind-session");
+    expect(model.messages.filter((message) => message.role === "user").map((message) => message.content)).toEqual(["edited"]);
+    mocks.userDataRoot = "";
+  });
+
+  it("v2 keep_user regenerate 只追加 rewind，不追加或 patch user", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-keep-"));
+    roots.push(root);
+    mocks.userDataRoot = root;
+    const record = {
+      id: "keep-session", title: "keep", identityId: null, createdAt: 1, updatedAt: 1,
+      schemaVersion: 2, messageCount: 1, mode: "chat" as const,
+    };
+    const { runHandler } = await setupBridge(async (input: any) => ({
+      options: {
+        settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+        messages: input.modelContext.messages,
+        timeoutMs: 1000, toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL",
+      },
+      latestUserText: input.currentUser.text,
+    }));
+    mocks.getSessionRecord.mockReturnValue(record);
+    mocks.composeSession.mockImplementation((_record: unknown, messages: unknown[]) => ({ ...record, messages }));
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const journal = new ConversationJournalService(getConversationTranscriptStore(root));
+    await journal.appendUser("keep-session", { id: "u1", turnId: "u1", text: "old", at: 1, revision: 1 });
+    await journal.createRunSink({ conversationId: "keep-session", runId: "old", assistantTurnId: "old-answer" })
+      .appendAssistant({ message: { role: "assistant", content: "old answer" }, roundId: "reply" });
+    await runHandler({ sender: makeSender() }, { assistantTurnId: "fixture-74598",
+      sessionId: "keep-session",
+      currentUser: { turnId: "u1", text: "old", visibleContent: "new visible", sticker: "wave" },
+      transcriptRewind: { anchorUserTurnId: "u1", expectedAssistantMessageId: "old-answer", disposition: "keep_user" },
+    });
+    const transcript = await getConversationTranscriptStore(root).read("keep-session");
+    expect(transcript.entries.filter((entry) => entry.kind === "user")).toHaveLength(1);
+    expect(transcript.entries.filter((entry) => entry.kind === "turn_rewind")).toHaveLength(1);
+    expect(transcript.entries.filter((entry) => entry.kind === "presentation_patch")).toHaveLength(0);
+    mocks.userDataRoot = "";
+  });
+
+  it.each([
+    ["canonical", "appendUser"],
+    ["presentation", "appendPresentation"],
+    ["model context", "buildModelContext"],
+  ] as const)("%s 故障只影响所属层", async (_label, method) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-fail-closed-"));
+    roots.push(root);
+    mocks.userDataRoot = root;
+    const record = {
+      id: "fail-closed", title: "fail", identityId: null, createdAt: 1, updatedAt: 1,
+      schemaVersion: 2, messageCount: 0, mode: "chat" as const,
+    };
+    mocks.getSessionRecord.mockReturnValue(record);
+    mocks.composeSession.mockImplementation((_record: unknown, messages: unknown[]) => ({ ...record, messages }));
+    const seen: unknown[] = [];
+    const { runHandler } = await setupBridge(async (input: unknown) => {
+      seen.push(input);
+      return {
+        options: { settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 }, messages: [], timeoutMs: 1000, toolSystemContent: "TOOL", soulSystemBaseContent: "SOUL" },
+        latestUserText: "next",
+      };
+    });
+    mocks.getSessionRecord.mockReturnValue(record);
+    mocks.composeSession.mockImplementation((_record: unknown, messages: unknown[]) => ({ ...record, messages }));
+    const { ConversationJournalService } = await import("./orchestrator/conversation-journal-service");
+    const failure = vi.spyOn(ConversationJournalService.prototype, method as "appendUser" | "appendPresentation" | "buildModelContext")
+      .mockRejectedValueOnce(new Error(`FAIL_${method}`));
+    const call = runHandler({ sender: makeSender() }, { assistantTurnId: "fixture-76837",
+      sessionId: "fail-closed",
+      currentUser: { turnId: "u1", text: "next", visibleContent: "展示" },
+    });
+    if (method === "appendPresentation") {
+      await expect(call).resolves.toMatchObject({ success: true });
+      expect(seen).toHaveLength(1);
+      expect(mocks.runCyreneAgent).toHaveBeenCalledTimes(1);
+      const { ConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+      expect((await new ConversationTranscriptStore(root).read("fail-closed")).entries.some(entry => entry.kind === "user")).toBe(true);
+    } else {
+      await expect(call).rejects.toThrow(`FAIL_${method}`);
+      expect(seen).toHaveLength(0);
+      expect(mocks.runCyreneAgent).not.toHaveBeenCalled();
+    }
+    failure.mockRestore();
+    await expect(runHandler({ sender: makeSender() }, { assistantTurnId: "next-assistant", sessionId: "fail-closed", currentUser: { turnId: "u2", text: "continue", visibleContent: "continue" } })).resolves.toMatchObject({ success: true });
+    mocks.userDataRoot = "";
+  });
+
+  it("合并轨迹不确定效果与派发侧 recoveryContext，不互相覆盖", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-recovery-"));
+    roots.push(root);
+    mocks.userDataRoot = root;
+    mocks.getSession.mockReturnValue({
+      id: "chat-recovery-merge",
+      mode: "chat",
+      messages: [
+        { id: "m1", role: "user", content: "旧问题", at: 1 },
+        { id: "u1", role: "user", content: "当前输入", at: 2 },
+      ],
+    });
+    const { runHandler } = await setupBridge(async (input: unknown) => ({
+      options: {
+        settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+        messages: [],
+        timeoutMs: 1000,
+        toolSystemContent: "TOOL",
+        soulSystemBaseContent: "SOUL",
+        recoveryContext: "轨迹侧：上次运行有未确认副作用",
+      },
+      latestUserText: "当前输入",
+    }));
+    const sender = makeSender();
+
+    await runHandler({ sender }, { assistantTurnId: "fixture-78072",
+      messages: [{ role: "user", content: "当前输入" }],
+      sessionId: "chat-recovery-merge",
+      userTurnId: "u1",
+      recoveryContext: "派发侧：渠道恢复上下文",
+    });
+
+    const agentOptions = mocks.runCyreneAgent.mock.calls[0]?.[0] as { recoveryContext?: string };
+    expect(agentOptions?.recoveryContext).toContain("轨迹侧：上次运行有未确认副作用");
+    expect(agentOptions?.recoveryContext).toContain("派发侧：渠道恢复上下文");
+    mocks.userDataRoot = "";
+  });
+
+  // ── 四模式连续性验收：下一轮模型请求由权威轨迹物化（CTA Phase 1）──
+  it.each(["chat", "work", "code", "learn"] as const)(
+    "%s 模式下一轮模型请求使用权威轨迹上下文",
+    async (mode) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-modes-"));
+      roots.push(root);
+      mocks.userDataRoot = root;
+      const conversationId = `conv-${mode}`;
+      // work/code/learn 派发前必须绑定工作区；chat 不需要
+      const sessionShape = (messages: unknown[]) => ({
+        id: conversationId,
+        mode,
+        ...(mode !== "chat" ? { workspaceBinding: { workspaceRoot: "E:\\tmp\\workspace" } } : {}),
+        messages,
+      });
+      mocks.getSession.mockReturnValue(sessionShape([
+        { id: "turn-1", role: "user", content: "first-user", at: 1 },
+      ]));
+
+      // 物化函数占位：setupBridge 触发 resetModules 之后才能 import（保证与 bridge 共享单例）
+      let materialize: () => Promise<unknown[]> = async () => [];
+      const { runHandler } = await setupBridge(async (input: unknown) => ({
+        options: {
+          settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+          messages: await materialize(),
+          timeoutMs: 1000,
+          toolSystemContent: "TOOL",
+          soulSystemBaseContent: "SOUL",
+        },
+        latestUserText: (input as { messages?: Array<{ content?: string }> }).messages?.at(-1)?.content ?? "",
+      }));
+      const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+      const { buildModelContext, resolveTranscriptRetainTokens } = await import("./orchestrator/conversation-transcript-context");
+      const retainTokens = resolveTranscriptRetainTokens(256_000);
+      const noRuns = { get: () => null };
+      materialize = async () => (await buildModelContext({
+        store: getConversationTranscriptStore(root),
+        conversationId,
+        retainTokens,
+        runReader: noRuns,
+      })).messages;
+      const sender = makeSender();
+      const lastModelRequestMessages = () =>
+        (mocks.runCyreneAgent.mock.calls.at(-1)?.[0] as { messages: Array<Record<string, unknown>> }).messages;
+      // bridge 实际注入的轨迹提交端（生产接线断言，不手工绕路）
+      const sinkOfLastCall = () =>
+        (mocks.runCyreneAgent.mock.calls.at(-1)?.[0] as { transcriptSink?: import("./orchestrator/transcript-sink").TranscriptSink }).transcriptSink;
+
+      // 第一轮：当前 user 落盘，run 级提交端写入 canonical assistant
+      await runHandler({ sender }, { assistantTurnId: "fixture-80940",
+        messages: [{ role: "user", content: "first-user" }],
+        sessionId: conversationId,
+        userTurnId: "turn-1",
+      });
+      const firstSink = sinkOfLastCall();
+      expect(firstSink).toBeDefined();
+      // work/code/learn：第一轮含工具调用与 canonical 工具结果；chat：纯文本（ChatLoop 单轮路径）
+      const assistantEntryId = await firstSink!.appendAssistant({
+        message: mode === "chat"
+          ? { role: "assistant", content: "first-assistant" }
+          : {
+            role: "assistant",
+            content: "first-assistant",
+            toolCalls: [{ id: "call-1", name: "read_file", arguments: '{"path":"a.txt"}' }],
+          },
+      });
+      if (mode !== "chat") {
+        await firstSink.appendToolResult({
+          assistantEntryId,
+          message: { role: "tool", toolCallId: "call-1", name: "read_file", content: "文件内容" },
+          outcome: "success",
+        });
+      }
+
+      // 第二轮派发：渲染端已收到 assistant；回填 boundary 已存在，连续性只能来自权威轨迹
+      mocks.getSession.mockReturnValue(sessionShape([
+        { id: "turn-1", role: "user", content: "first-user", at: 1 },
+        { id: "a-1", role: "model", content: "first-assistant", at: 2 },
+        { id: "turn-2", role: "user", content: "second-user", at: 3 },
+      ]));
+      await runHandler({ sender }, { assistantTurnId: "fixture-82215",
+        messages: [{ role: "user", content: "second-user" }],
+        sessionId: conversationId,
+        userTurnId: "turn-2",
+      });
+
+      const messages = lastModelRequestMessages();
+      expect(messages).toEqual(expect.arrayContaining([
+        expect.objectContaining({ role: "user", content: "first-user" }),
+        expect.objectContaining({ role: "assistant", content: "first-assistant" }),
+        expect.objectContaining({ role: "user", content: "second-user" }),
+      ]));
+      if (mode !== "chat") {
+        // canonical 工具结果随轨迹重放，声明与结果保持配对
+        expect(messages).toEqual(expect.arrayContaining([
+          expect.objectContaining({ role: "tool", toolCallId: "call-1", content: "文件内容" }),
+        ]));
+      }
+      // 四模式各走各的执行通道：chat 单请求链路，其余走 harness 执行模式
+      const lastOptions = mocks.runCyreneAgent.mock.calls.at(-1)?.[0] as { executionMode?: string };
+      expect(lastOptions.executionMode).toBe(mode === "chat" ? "chat" : "work");
+      mocks.userDataRoot = "";
+    },
+  );
+
+  it("chat 模式跨工具开关保持轨迹连续（ChatLoop 与 Harness 共用权威轨迹）", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-bridge-chat-tools-"));
+    roots.push(root);
+    mocks.userDataRoot = root;
+    const conversationId = "conv-chat-tools";
+    const sessionShape = (messages: unknown[]) => ({ id: conversationId, mode: "chat", messages });
+    mocks.getSession.mockReturnValue(sessionShape([
+      { id: "turn-1", role: "user", content: "first-user", at: 1 },
+    ]));
+
+    let materialize: () => Promise<unknown[]> = async () => [];
+    const { runHandler } = await setupBridge(async (input: unknown) => ({
+      options: {
+        settings: { provider: "test", baseUrl: "", model: "", apiKey: "", contextWindowTokens: 256000 },
+        messages: await materialize(),
+        timeoutMs: 1000,
+        toolSystemContent: "TOOL",
+        soulSystemBaseContent: "SOUL",
+      },
+      latestUserText: (input as { messages?: Array<{ content?: string }> }).messages?.at(-1)?.content ?? "",
+    }));
+    const { getConversationTranscriptStore } = await import("./orchestrator/conversation-transcript-store");
+    const { buildModelContext, resolveTranscriptRetainTokens } = await import("./orchestrator/conversation-transcript-context");
+    const retainTokens = resolveTranscriptRetainTokens(256_000);
+    materialize = async () => (await buildModelContext({
+      store: getConversationTranscriptStore(root),
+      conversationId,
+      retainTokens,
+      runReader: { get: () => null },
+    })).messages;
+    const sender = makeSender();
+    const lastModelRequestMessages = () =>
+      (mocks.runCyreneAgent.mock.calls.at(-1)?.[0] as { messages: Array<Record<string, unknown>> }).messages;
+    // bridge 实际注入的轨迹提交端（生产接线断言，不手工绕路）
+    const sinkOfLastCall = () =>
+      (mocks.runCyreneAgent.mock.calls.at(-1)?.[0] as { transcriptSink?: import("./orchestrator/transcript-sink").TranscriptSink }).transcriptSink;
+
+    // 轮次 1：无工具（ChatLoop 单请求路径，assistant 无 roundId）
+    await runHandler({ sender }, { assistantTurnId: "fixture-85231",
+      messages: [{ role: "user", content: "first-user" }],
+      sessionId: conversationId,
+      userTurnId: "turn-1",
+    });
+    const chatSink = sinkOfLastCall();
+    expect(chatSink).toBeDefined();
+    await chatSink!.appendAssistant({ message: { role: "assistant", content: "first-assistant" } });
+
+    // 轮次 2：启用工具（Harness 路径，含工具调用与 canonical 结果）
+    mocks.getSession.mockReturnValue(sessionShape([
+      { id: "turn-1", role: "user", content: "first-user", at: 1 },
+      { id: "a-1", role: "model", content: "first-assistant", at: 2 },
+      { id: "turn-2", role: "user", content: "second-user", at: 3 },
+    ]));
+    await runHandler({ sender }, { assistantTurnId: "fixture-85889",
+      messages: [{ role: "user", content: "second-user" }],
+      sessionId: conversationId,
+      userTurnId: "turn-2",
+    });
+    const harnessSink = sinkOfLastCall();
+    expect(harnessSink).toBeDefined();
+    const harnessAssistantEntryId = await harnessSink!.appendAssistant({
+      message: {
+        role: "assistant",
+        content: "second-assistant",
+        toolCalls: [{ id: "call-1", name: "read_file", arguments: '{"path":"a.txt"}' }],
+      },
+    });
+    await harnessSink.appendToolResult({
+      assistantEntryId: harnessAssistantEntryId,
+      message: { role: "tool", toolCallId: "call-1", name: "read_file", content: "工具结果" },
+      outcome: "success",
+    });
+
+    // 轮次 3：再关闭工具（回到 ChatLoop），三轮历史必须在同一条轨迹里保持连续
+    mocks.getSession.mockReturnValue(sessionShape([
+      { id: "turn-1", role: "user", content: "first-user", at: 1 },
+      { id: "a-1", role: "model", content: "first-assistant", at: 2 },
+      { id: "turn-2", role: "user", content: "second-user", at: 3 },
+      { id: "a-2", role: "model", content: "second-assistant", at: 4 },
+      { id: "turn-3", role: "user", content: "third-user", at: 5 },
+    ]));
+    await runHandler({ sender }, { assistantTurnId: "fixture-87068",
+      messages: [{ role: "user", content: "third-user" }],
+      sessionId: conversationId,
+      userTurnId: "turn-3",
+    });
+
+    expect(lastModelRequestMessages()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "user", content: "first-user" }),
+      expect.objectContaining({ role: "assistant", content: "first-assistant" }),
+      expect.objectContaining({ role: "user", content: "second-user" }),
+      expect.objectContaining({ role: "assistant", content: "second-assistant" }),
+      expect.objectContaining({ role: "tool", toolCallId: "call-1", content: "工具结果" }),
+      expect.objectContaining({ role: "user", content: "third-user" }),
+    ]));
+    mocks.userDataRoot = "";
+  });
+});

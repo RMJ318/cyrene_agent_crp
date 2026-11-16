@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "crp-memory": {
+      "type": "streamable-http",
+      "url": "https://memory.example.com/mcp",
+      "extensions": {
+        "com.openai.auth": {
+          "type": "oauth",
+          "client": { "mode": "cimd" }
+        }
+      }
+    }
+  }
+}
