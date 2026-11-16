@@ -7,6 +7,8 @@ import { fail, modelConsentTarget, validateScope } from "./safety";
 import { loadModelSettings, resolveSessionModelSettings } from "../settings/model-settings";
 import * as chatsStore from "../chats/chats-store";
 import { createLocalEmbeddingProvider } from "../rag/embedding";
+import { CrpSyncClient, loadSyncClientConfig } from "../crp-sync/client";
+import { collectMemoryFiles } from "../crp-sync/collector";
 
 export function initializeMemoryBridge(forbiddenRoots: () => string[]): MemoryBridgeService {
   const service = new MemoryBridgeService(path.join(app.getPath("userData"), "crp-memory-bridge"), {
@@ -15,6 +17,18 @@ export function initializeMemoryBridge(forbiddenRoots: () => string[]): MemoryBr
     decrypt: cipher => safeStorage.decryptString(Buffer.from(cipher, "base64")),
   }, undefined, forbiddenRoots, () => createLocalEmbeddingProvider("bgem3", { persistentIdentity: true }));
   setMemoryBridgeRuntime(service);
+  try {
+    const userData = app.getPath("userData"), config = loadSyncClientConfig(userData);
+    if (config) {
+      const client = new CrpSyncClient(userData, config, {
+        adopt: (source, provenance, signal) => service.import(source, signal, false, provenance),
+        collect: async () => collectMemoryFiles(userData, (await chatsStore.listSessions()).map(s => s.workspaceRoot).filter((p): p is string => typeof p === "string" && !!p)),
+      });
+      service.setSynchronization(client); client.start();
+    }
+  } catch {
+    service.setSynchronization({ status: () => ({ lastError: "SYNC_CONFIG_OR_START_FAILED" }), tick: async () => undefined, close: async () => undefined });
+  }
   return service;
 }
 export function registerMemoryBridgeIpc(input: {
@@ -38,6 +52,7 @@ export function registerMemoryBridgeIpc(input: {
           return { ok: true, value: command === "set-recall" ? service.setRecallRealities(id, args.realities) : service.recallState(id) };
         }
         case "status": return { ok: true, value: service.status() };
+        case "sync-now": return { ok: true, value: await service.synchronizeNow() };
         case "model-target": {
           service.policy.scope(String(args.sessionId));
           const session = await chatsStore.getSessionRecord(String(args.sessionId));

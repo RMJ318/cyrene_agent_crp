@@ -88,6 +88,12 @@ export function MemoryBridgePanel() {
     <p>只读获取默认分支的最新 commit，使用本机 Git 凭证；私有仓库需先在本机配置 Git 读取权限，不在此输入令牌。</p>
     {status?.githubSource && <p>GitHub 来源：{status.githubSource.repository} · commit：{status.githubSource.commit}</p>}
     <p>当前快照：{status?.snapshotId ?? "未配置"} · 检索付费预算：USD 0</p>
+    {status?.sync && <div aria-label="CRP 自动同步">
+      <p>服务器同步：{status.sync.lastError ? `等待重试（${status.sync.lastError}）` : status.sync.commit ? `最近已同步 ${status.sync.commit.slice(0, 12)}` : "正在连接"}
+        {status.sync.uploadedRevision !== undefined && ` · 记忆已上传第 ${status.sync.uploadedRevision} 版`}
+        {status.sync.publishedRevision !== undefined && ` · GitHub PR 已保存第 ${status.sync.publishedRevision} 版`}</p>
+      <Button disabled={busy} onClick={() => void action(async () => { await call("sync-now"); })}>立即同步并刷新状态</Button>
+    </div>}
     <Checkbox checked={status?.retrievalV3Enabled === true} disabled={busy || !retrievalV3Available} onChange={e => void action(async () => { await call("retrieval-v3", { enabled: e.target.checked }); })}>试用 CRP 3.0 检索：授权原文片段、文稿正文与多路融合（可关闭回退）</Checkbox>
     {status && !retrievalV3Available && <p>当前主进程尚未提供 CRP 3.0 检索；请正常重启 Cyrene 后再启用。已加载快照与原检索保持可用。</p>}
     <Checkbox checked={status?.localSemanticEnabled === true && !status?.localModelsDisabled} disabled={busy || status?.localModelsDisabled} onChange={e => void action(async () => { await call("local-semantic", { enabled: e.target.checked }); })}>启用已安装的本地 BGE-M3 语义检索（不下载、不联网；默认仅 BM25）</Checkbox>

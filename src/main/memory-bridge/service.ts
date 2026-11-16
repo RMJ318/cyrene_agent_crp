@@ -6,14 +6,14 @@ import type { CrpAlias, CrpDocument } from "../crp-core/contracts";
 import { CRP_CONTRACT_VERSION } from "../crp-core/contracts";
 import { PersistentCrpIndex } from "../crp-core/persistent-index";
 import path from "node:path";
-import type { BridgeMemory, BridgeResult, BridgeScope, BridgeStatus, ContinuityMapping, LocalMemoryInput } from "../../shared/memory-bridge";
+import type { BridgeMemory, BridgeResult, BridgeScope, BridgeStatus, BridgeSyncStatus, ContinuityMapping, LocalMemoryInput } from "../../shared/memory-bridge";
 import { BridgePolicy, bridgePolicy } from "./policy";
 import { LocalMemoryStore, type PrivateCodec } from "./local-store";
 import { CrpSnapshot, importSnapshot } from "./snapshot";
 import { assertNotAborted, atomicJson, fail, hash, readBounded, safePath, validateScope, visible, within } from "./safety";
 import { rankTextCandidates } from "../rag/text-ranking";
 import type { EmbeddingProvider } from "../rag/embedding";
-import { cosineSimilarity } from "../rag/vectorstore";
+import { cosineSimilarity } from "../rag/vector-math";
 import { boundBridgeResult } from "./result-budget";
 import type { RealityRecallState } from "../../shared/memory-bridge";
 
@@ -32,6 +32,7 @@ export class MemoryBridgeService {
   private draftRealities: string[] = [];
   private retrievalV3Enabled = false;
   private recallReferences = new Map<string, { fingerprint: string; expires: number; memory: Pick<BridgeMemory, "memoryId" | "domain" | "realityId" | "branchId"> }>();
+  private synchronization?: { status(): BridgeSyncStatus; tick(): Promise<void>; close(): Promise<void> };
   constructor(readonly root: string, private codec: PrivateCodec, readonly policy: BridgePolicy = bridgePolicy, private forbiddenRoots: () => string[] = () => [], private localEmbeddingFactory?: () => EmbeddingProvider | null) {
     this.assertDataRoot();
     policy.initialize(root);
@@ -177,13 +178,16 @@ export class MemoryBridgeService {
   }
   setPluginActive(active: boolean): void { this.changed(); this.pluginActive = active; }
   setEnabled(enabled: boolean): void { if (!enabled) this.policy.resetRecallContexts(); this.save({ ...this.settings, enabled }); this.changed(); }
-  status(): BridgeStatus { return { enabled: this.settings.enabled && this.pluginActive, configuredEnabled: this.settings.enabled, pluginActive: this.pluginActive, retrievalV3Enabled: this.retrievalV3Enabled, localModelsDisabled: process.env.CYRENE_CRP_DISABLE_LOCAL_MODELS === "1", localSemanticEnabled: this.settings.localSemanticEnabled === true, snapshotId: this.settings.snapshot, githubSource: this.settings.snapshot ? this.settings.githubSources?.[this.settings.snapshot] : undefined, sessions: this.policy.list(), paidBudgetUsd: 0 }; }
+  status(): BridgeStatus { return { ...(this.synchronization ? { sync: this.synchronization.status() } : {}), enabled: this.settings.enabled && this.pluginActive, configuredEnabled: this.settings.enabled, pluginActive: this.pluginActive, retrievalV3Enabled: this.retrievalV3Enabled, localModelsDisabled: process.env.CYRENE_CRP_DISABLE_LOCAL_MODELS === "1", localSemanticEnabled: this.settings.localSemanticEnabled === true, snapshotId: this.settings.snapshot, githubSource: this.settings.snapshot ? this.settings.githubSources?.[this.settings.snapshot] : undefined, sessions: this.policy.list(), paidBudgetUsd: 0 }; }
+  setSynchronization(sync: NonNullable<MemoryBridgeService["synchronization"]>): void { this.synchronization = sync; }
+  async synchronizeNow(): Promise<BridgeSyncStatus | undefined> { await this.synchronization?.tick(); return this.synchronization?.status(); }
+  async stopSynchronization(): Promise<void> { const sync = this.synchronization; this.synchronization = undefined; await sync?.close(); }
   setLocalSemantic(enabled: boolean): void {
     if (enabled && process.env.CYRENE_CRP_DISABLE_LOCAL_MODELS === "1") fail("LOCAL_MODELS_DISABLED");
     if (enabled && this.localEmbeddingFactory?.()?.cacheIdentity?.provider !== "local") fail("LOCAL_MODEL_NOT_INSTALLED");
     this.save({ ...this.settings, localSemanticEnabled: enabled }); this.changed();
   }
-  close(): void { this.setPluginActive(false); for (const store of this.stores.values()) store.close(); this.stores.clear(); }
+  close(): void { void this.stopSynchronization().catch(() => undefined); this.setPluginActive(false); for (const store of this.stores.values()) store.close(); this.stores.clear(); }
   private store(domain: "writer" | "reality0"): LocalMemoryStore {
     let store = this.stores.get(domain);
     if (!store) {
@@ -197,7 +201,8 @@ export class MemoryBridgeService {
     }
     return store;
   }
-  async import(source: string, signal?: AbortSignal, github = false): Promise<string> {
+  async import(source: string, signal?: AbortSignal, github = false, origin?: { repository: string; commit: string }): Promise<string> {
+    if (origin && (github || githubRepository(origin.repository) !== origin.repository || !/^[a-f0-9]{40}$/.test(origin.commit))) fail("INVALID_SYNC_PROVENANCE");
     if (this.importing) fail("IMPORT_BUSY");
     this.importing = true;
     const generation = this.generation;
@@ -205,7 +210,7 @@ export class MemoryBridgeService {
     let workspace: string | undefined;
     try {
       this.assertDataRoot();
-      let provenance: { repository: string; commit: string } | undefined;
+      let provenance: { repository: string; commit: string } | undefined = origin;
       if (github) {
         const repository = githubRepository(source);
         const parent = this.directory("github-imports");
@@ -221,7 +226,12 @@ export class MemoryBridgeService {
       const githubSources: NonNullable<Settings["githubSources"]> = {};
       if (this.settings.snapshot && this.settings.githubSources?.[this.settings.snapshot]) githubSources[this.settings.snapshot] = this.settings.githubSources[this.settings.snapshot];
       if (provenance) githubSources[snapshot.manifest.snapshotId] = provenance;
-      this.save({ ...this.settings, githubSources, previousSnapshot: this.settings.snapshot, snapshot: snapshot.manifest.snapshotId });
+      const continuity = [...(this.settings.continuity ?? [])];
+      if (origin) for (const note of this.settings.continuity ?? []) {
+        if (note.snapshotId === this.settings.snapshot && snapshot.manifest.files[note.path] === note.sha256
+          && !continuity.some(n => n.id === note.id && n.snapshotId === snapshot.manifest.snapshotId)) continuity.push({ ...note, snapshotId: snapshot.manifest.snapshotId });
+      }
+      this.save({ ...this.settings, githubSources, ...(origin ? { continuity } : {}), previousSnapshot: this.settings.snapshot, snapshot: snapshot.manifest.snapshotId });
       this.snapshot = snapshot; this.changed();
       return snapshot.manifest.snapshotId;
     } finally {

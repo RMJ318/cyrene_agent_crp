@@ -397,7 +397,7 @@ export function createDefaultApplicationDependencies(): ApplicationDependencies 
 
       createLowCostServices: () => {
         const bridge = initializeMemoryBridge(() => [app.getAppPath(), loadObsidianVaultConfig().vaultPath].filter(Boolean));
-        shutdown.register({ id: "memory-bridge", phase: "stopLocalResources", dispose: () => bridge.close() });
+        shutdown.register({ id: "memory-bridge", phase: "stopLocalResources", dispose: async () => { await bridge.stopSynchronization(); bridge.close(); } });
         const runtimeStateService = createRuntimeStateService();
         runtimeStateService.onChange(() => {
           broadcastToAuxWindows(IPC.RUNTIME_STATE_CHANGED, runtimeStateService.getState());

@@ -29,7 +29,8 @@ export interface LocalMemoryInput {
 export interface LocalMemoryRecord extends LocalMemoryInput {
   id: string; domain: "writer" | "reality0"; revision: number; deleted: boolean; createdAt: string;
 }
-export interface BridgeStatus { retrievalV3Enabled?: boolean; localModelsDisabled?: boolean; githubSource?: { repository: string; commit: string }; enabled: boolean; configuredEnabled?: boolean; pluginActive?: boolean; localSemanticEnabled?: boolean; snapshotId?: string; sessions: Array<{ id: string; scope: BridgeScope; active: boolean }>; paidBudgetUsd: 0 }
+export interface BridgeSyncStatus { commit?: string; snapshotId?: string; uploadedRevision?: number; publishedRevision?: number; prUrl?: string; lastIncomingAt?: string; lastOutgoingAt?: string; lastError?: string }
+export interface BridgeStatus { sync?: BridgeSyncStatus; retrievalV3Enabled?: boolean; localModelsDisabled?: boolean; githubSource?: { repository: string; commit: string }; enabled: boolean; configuredEnabled?: boolean; pluginActive?: boolean; localSemanticEnabled?: boolean; snapshotId?: string; sessions: Array<{ id: string; scope: BridgeScope; active: boolean }>; paidBudgetUsd: 0 }
 export interface ContinuityMapping {
   id: string; snapshotId: string; path: string; sha256: string; scope: BridgeScope;
   content: string; participants: string[];
